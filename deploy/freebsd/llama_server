@@ -1,0 +1,42 @@
+#!/bin/sh
+
+# PROVIDE: llama_server
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="llama_server"
+rcvar="llama_server_enable"
+
+load_rc_config "$name"
+
+: "${llama_server_enable:=NO}"
+: "${llama_server_user:=root}"
+: "${llama_server_bin:=/usr/local/bin/llama-server}"
+: "${llama_server_model:=/mnt/models/Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf}"
+: "${llama_server_mmproj:=/mnt/models/mmproj-F16.gguf}"
+: "${llama_server_threads:=4}"
+: "${llama_server_batch:=512}"
+: "${llama_server_ubatch:=256}"
+: "${llama_server_ctx:=4096}"
+: "${llama_server_parallel:=1}"
+: "${llama_server_host:=0.0.0.0}"
+: "${llama_server_port:=8892}"
+
+pidfile="/var/run/${name}.pid"
+
+# NOTE: do NOT define a variable named `${name}_flags` (llama_server_flags).
+# rc.subr treats `${name}_flags` as `rc_flags` and inserts it between
+# $command and $command_args, which would feed the first llama-server
+# option (e.g. -m) to daemon(8) as the program to exec. Keep all
+# llama-server options in command_args here so daemon sees a clean set.
+#
+# -P (supervisor pidfile) is used instead of -p (child pidfile) so
+# rc.subr's check_pidfile matches the recorded pid against $command
+# (/usr/sbin/daemon); daemon then forwards SIGTERM to llama-server
+# and removes the pidfile on exit.
+command="/usr/sbin/daemon"
+command_args="-f -P ${pidfile} -u ${llama_server_user} ${llama_server_bin} -m ${llama_server_model} --mmproj ${llama_server_mmproj} -t ${llama_server_threads} -b ${llama_server_batch} -ub ${llama_server_ubatch} -c ${llama_server_ctx} --parallel ${llama_server_parallel} --host ${llama_server_host} --port ${llama_server_port}"
+
+run_rc_command "$1"

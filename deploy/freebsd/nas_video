@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# PROVIDE: nas_video
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="nas_video"
+rcvar="nas_video_enable"
+
+load_rc_config "$name"
+
+: "${nas_video_enable:=NO}"
+: "${nas_video_user:=nasvideo}"
+: "${nas_video_chdir:=/usr/local/mine_nas_ai_video}"
+: "${nas_video_uv:=/usr/local/bin/uv}"
+: "${nas_video_run_args:=run nas-video}"
+
+pidfile="/var/run/${name}.pid"
+
+# NOTE: do NOT use a variable named `${name}_flags` (nas_video_flags).
+# rc.subr treats `${name}_flags` as `rc_flags` and inserts it between
+# $command and $command_args, which would feed the uv subcommand (`run`)
+# to daemon(8) as the program to exec. The uv args are passed inside
+# command_args here so daemon receives a clean option set.
+command="/usr/sbin/daemon"
+# Use -P (supervisor pidfile) not -p (child pidfile): rc.subr's
+# check_pidfile matches the pidfile's process against $command
+# (/usr/sbin/daemon). -p records the spawned child (sh/uv), whose comm
+# is not "daemon", so stop/status would report "not running". -P
+# records the daemon supervisor pid, and daemon forwards SIGTERM to
+# the child and removes the pidfile on exit.
+command_args="-f -P ${pidfile} -u ${nas_video_user} /bin/sh -c 'export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_run_args}'"
+
+run_rc_command "$1"

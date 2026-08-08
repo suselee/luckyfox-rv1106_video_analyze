@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+var/
+edge/rv1106/board_service/src/*.o
+edge/rv1106/board_service/daughter_watch
+edge/rv1106/board_service/enroll
+edge/rv1106/board_service/decode_test
+edge/rv1106/board_service/rockiva_probe
+edge/rv1106/board_service/track_fusion_test
+edge/rv1106/board_service/schedule_test
+edge/rv1106/board_service/install/
+/check*_*.onnx

@@ -1,0 +1,12 @@
+# Person filter dependencies (optional, only needed when PERSON_FILTER_ENABLED=true).
+#
+# On FreeBSD the runtime packages are provided by the OS, install with:
+#   pkg install py311-opencv py311-numpy
+# Recreate the uv environment so it can import those system packages:
+#   uv venv --clear --python /usr/local/bin/python3.11 --system-site-packages
+#
+# For non-FreeBSD / local development you can pip-install the headless wheel:
+#   pip install -r requirements-filter.txt
+# Total download: ~30MB (opencv wheel + numpy)
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
