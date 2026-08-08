@@ -36,6 +36,7 @@ from .ffmpeg_tools import (
     sample_frames_at_fps,
     segment_time_window,
 )
+from .ingest import IngestSpool, save_ingested_clip
 from .llm import AnalysisResult, DaughterVerification, LlamaAnalyzer
 from .mqtt import MQTTSubscriber, decode_json_payload
 
@@ -370,6 +371,7 @@ class Supervisor:
         self._llama_circuit_open_until: datetime | None = None
         self._last_board_saved_at: str | None = None
         self._last_board_moment_id: int | None = None
+        self._board_ingest_last_moment_id: int | None = None
         self._board_probable_detector: DaughterDetector | None = None
         self._probable_verified = 0
         self._probable_rejected = 0
@@ -400,6 +402,7 @@ class Supervisor:
             "rv1106": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
             "day_archive": {"status": "not-started"},
+            "board_ingest": {"status": "not-started"},
         }
 
     async def start(self) -> None:
@@ -418,6 +421,16 @@ class Supervisor:
             )
         else:
             self.state["mqtt"] = {"status": "disabled", "reason": "MQTT_ENABLED=false"}
+
+        if self.settings.board_ingest_enabled:
+            self.tasks.append(
+                asyncio.create_task(self._board_ingest_loop(), name="board-ingest")
+            )
+        else:
+            self.state["board_ingest"] = {
+                "status": "disabled",
+                "reason": "BOARD_INGEST_ENABLED=false",
+            }
 
         low_rtsp_url = self.settings.rtsp_low_url_for_ffmpeg
         high_rtsp_url = self.settings.rtsp_high_url_for_ffmpeg
@@ -682,6 +695,56 @@ class Supervisor:
                 raise
             except Exception as exc:
                 self._safe_add_event("board-event-error", str(exc))
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=_BOARD_SESSION_SCAN_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _board_ingest_loop(self) -> None:
+        """处理板端 HTTP 上传队列 (board_ingest_dir/pending)。"""
+        spool = IngestSpool(self.settings)
+        while not self.stop_event.is_set():
+            try:
+                jobs = await asyncio.to_thread(spool.pending_jobs)
+                for job_dir in jobs:
+                    try:
+                        moment_id = await save_ingested_clip(
+                            self.settings, self.database, spool, job_dir
+                        )
+                        if moment_id is not None:
+                            self._board_ingest_last_moment_id = moment_id
+                            self._safe_add_event(
+                                "moment",
+                                f"saved board-uploaded moment {moment_id}",
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        attempts = await asyncio.to_thread(
+                            self.database.record_ingested_error,
+                            job_dir.name,
+                            str(exc),
+                            self.settings.board_ingest_max_attempts,
+                        )
+                        self._safe_add_event(
+                            "board-ingest-error",
+                            f"{job_dir.name} attempt {attempts}: {exc}",
+                        )
+                        if attempts >= self.settings.board_ingest_max_attempts:
+                            await asyncio.to_thread(spool.fail, job_dir)
+                self.state["board_ingest"] = {
+                    "status": "running",
+                    "pending": await asyncio.to_thread(spool.pending_count),
+                    "queued_failed": self.database.count_pending_ingested_clips(),
+                    "last_moment_id": self._board_ingest_last_moment_id,
+                    "updated_at": utc_now_iso(),
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._safe_add_event("board-ingest-error", str(exc))
             try:
                 await asyncio.wait_for(
                     self.stop_event.wait(), timeout=_BOARD_SESSION_SCAN_SECONDS
@@ -2320,6 +2383,9 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "rv1106_accept_probable": settings.rv1106_accept_probable,
             "rv1106_probable_policy": settings.rv1106_probable_policy,
             "rv1106_save_wait_seconds": settings.rv1106_save_wait_seconds,
+            "board_ingest_enabled": settings.board_ingest_enabled,
+            "board_ingest_dir": str(settings.board_ingest_dir),
+            "board_ingest_max_bytes": settings.board_ingest_max_bytes,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "llama_analysis_temperature": settings.llama_analysis_temperature,
@@ -2357,6 +2423,11 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "pending_high": database.count_pending_segments(stream_role="high"),
             "latest_low": database.latest_segment("low"),
             "latest_high": database.latest_segment("high"),
+        },
+        "board_ingest": {
+            "enabled": settings.board_ingest_enabled,
+            "done": database.count_ingested_done(),
+            "failed": database.count_pending_ingested_clips(),
         },
         "stream_alignment": (
             supervisor.snapshot().get("stream_alignment", {"status": "unknown"})

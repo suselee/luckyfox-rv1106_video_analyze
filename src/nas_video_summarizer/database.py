@@ -134,6 +134,17 @@ class Database:
                     FOREIGN KEY(session_key) REFERENCES board_sessions(session_key)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS ingested_clips (
+                    event_key TEXT PRIMARY KEY,
+                    moment_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    try_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(moment_id) REFERENCES moments(id) ON DELETE SET NULL
+                );
                 """
             )
             columns = {
@@ -453,6 +464,82 @@ class Database:
                 (session_key,),
             ).fetchone()
         return int(row["attempts"]) if row else 0
+
+    def ingested_moment_id(self, event_key: str) -> int | None:
+        """已成功入库的板端上传 event_key 对应的 moment id (幂等去重)。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT moment_id FROM ingested_clips "
+                "WHERE event_key=? AND moment_id IS NOT NULL",
+                (event_key,),
+            ).fetchone()
+        return int(row["moment_id"]) if row else None
+
+    def record_ingested_done(self, event_key: str, moment_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingested_clips(event_key, moment_id, status, try_count,
+                                           created_at, updated_at)
+                VALUES (?, ?, 'done', 0, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    moment_id=excluded.moment_id,
+                    status='done',
+                    try_count=0,
+                    last_error=NULL,
+                    updated_at=excluded.updated_at
+                """,
+                (event_key, moment_id, local_now_iso(), local_now_iso()),
+            )
+
+    def record_ingested_error(
+        self, event_key: str, error: str, max_attempts: int | None = None
+    ) -> int:
+        """记录一次处理失败, 返回累计尝试次数。
+
+        达到 max_attempts (或未指定) 时置 status='failed', 否则保留 'queued'。
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingested_clips(event_key, status, try_count,
+                                           last_error, created_at, updated_at)
+                VALUES (?, 'queued', 1, ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    status='queued',
+                    try_count=try_count+1,
+                    last_error=?,
+                    updated_at=?
+                """,
+                (event_key, error[:2000], local_now_iso(), local_now_iso(),
+                 error[:2000], local_now_iso()),
+            )
+            row = conn.execute(
+                "SELECT try_count FROM ingested_clips WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+            try_count = int(row["try_count"]) if row else 0
+            if max_attempts is None or try_count >= max_attempts:
+                conn.execute(
+                    "UPDATE ingested_clips SET status='failed', updated_at=? "
+                    "WHERE event_key=?",
+                    (local_now_iso(), event_key),
+                )
+        return try_count
+
+    def count_pending_ingested_clips(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM ingested_clips WHERE status='failed'"
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def count_ingested_done(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM ingested_clips WHERE status='done'"
+            ).fetchone()
+        return int(row["n"]) if row else 0
 
     def upsert_segment(
         self,

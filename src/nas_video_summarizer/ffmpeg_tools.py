@@ -542,6 +542,40 @@ def _concat_escape(path: Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
+async def remux_elementary_stream(
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+    *,
+    es_format: str | None = None,
+) -> None:
+    """把裸基本流 (H.264/H.265 Annex-B) 以 -c copy 重封装为 MP4。
+
+    es_format 为 ffmpeg 输入格式名 ("h264"/"hevc"); 为 None 时由 ffmpeg
+    按文件扩展名自行探测。仅用于板端上传的板载环形缓冲片段。
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        settings.ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+    ]
+    if es_format:
+        command += ["-f", es_format]
+    command += [
+        "-i",
+        str(input_path),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    await _run_command(command, "ffmpeg remux failed")
+
+
 async def concat_segments(settings: Settings, segment_paths: list[Path], output_path: Path) -> None:
     if not segment_paths:
         raise ValueError("no segment paths provided")

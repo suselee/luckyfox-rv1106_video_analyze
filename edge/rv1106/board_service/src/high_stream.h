@@ -63,6 +63,7 @@ private:
         std::vector<uint8_t> data;
         std::string meta_json;
         std::string session_id;
+        std::string clip_name;  // clip.h264 / clip.hevc
         int attempts = 0;
         double next_ts = 0.0;
     };
@@ -78,6 +79,7 @@ private:
 
     HighStreamConfig cfg_;
     VideoRing ring_;
+    std::string codec_;  // "H264"/"H265" (feed 线程写, 单线程访问)
     pthread_t feed_th_ = 0;
     pthread_t upload_th_ = 0;
     volatile bool running_ = false;

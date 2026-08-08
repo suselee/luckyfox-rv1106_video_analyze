@@ -94,6 +94,7 @@ void HighStream::feed_loop() {
             }
             codec_storage = src.codec();
             codec_holder = &codec_storage;
+            codec_ = codec_storage;
             reconnect_wait = 2;
             printf("[HIGH] 4K stream connected, codec=%s, ring=%zu MB\n",
                    codec_storage.c_str(), cfg_.ring_mb);
@@ -162,6 +163,7 @@ void HighStream::make_clip(const FusionEvent& ev) {
     pc.data.swap(clip);
     pc.meta_json.swap(meta);
     pc.session_id = ev.session_id;
+    pc.clip_name = (codec_ == "H265") ? "clip.hevc" : "clip.h264";
     pc.next_ts = now_seconds();
 
     pthread_mutex_lock(&up_mu_);
@@ -177,7 +179,7 @@ void HighStream::make_clip(const FusionEvent& ev) {
 
 std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
                                   double clip_end, size_t clip_bytes) {
-    char buf[1024];
+    char buf[1080];
     snprintf(buf, sizeof(buf),
              "{\"session_id\":\"%s\",\"event\":\"%s\",\"identity\":\"%s\","
              "\"track_id\":%u,\"ts\":%.3f,\"session_start\":%.3f,"
@@ -186,14 +188,14 @@ std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
              "\"box\":[%.4f,%.4f,%.4f,%.4f],\"best_box\":[%.4f,%.4f,%.4f,%.4f],"
              "\"people_count\":%d,\"camera_id\":\"%s\","
              "\"clip_start\":%.3f,\"clip_end\":%.3f,\"clip_bytes\":%zu,"
-             "\"source\":\"board_high_ring\"}",
+             "\"codec\":\"%s\",\"source\":\"board_high_ring\"}",
              ev.session_id.c_str(), ev.event.c_str(), ev.identity.c_str(),
              ev.track_id, ev.timestamp, ev.session_start, ev.best_timestamp,
              ev.score, ev.face_score, ev.person_score, ev.activity_score,
              ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2,
              ev.best_box.x1, ev.best_box.y1, ev.best_box.x2, ev.best_box.y2,
              ev.people_count, cfg_.camera_id.c_str(),
-             clip_start, clip_end, clip_bytes);
+             clip_start, clip_end, clip_bytes, codec_.c_str());
     return std::string(buf);
 }
 
@@ -221,7 +223,7 @@ void HighStream::upload_loop() {
         std::vector<uint8_t> body = HttpUploader::build_multipart(
             boundary,
             {{"meta", pc.meta_json}},
-            pc.data.data(), pc.data.size(), "clip.h264");
+            pc.data.data(), pc.data.size(), pc.clip_name);
 
         HttpUploader::Response resp;
         bool ok = uploader.post(cfg_.upload_url, body, cfg_.upload_timeout, resp);

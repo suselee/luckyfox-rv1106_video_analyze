@@ -1,0 +1,305 @@
+import asyncio
+import json
+from dataclasses import replace
+from io import BytesIO
+from pathlib import Path
+
+import pytest
+
+from nas_video_summarizer import ingest as ingest_module
+from nas_video_summarizer.app import AppState, RequestHandler
+from nas_video_summarizer.config import load_settings
+from nas_video_summarizer.database import Database
+from nas_video_summarizer.ingest import (
+    IngestSpool,
+    ingest_event_key,
+    parse_multipart,
+    save_ingested_clip,
+    validate_meta,
+)
+from nas_video_summarizer.workers import Supervisor
+
+
+BOUNDARY = "dwclip-boundary"
+SAMPLE_META = {
+    "session_id": "1-3",
+    "event": "confirmed",
+    "identity": "confirmed",
+    "track_id": 3,
+    "ts": 1750000000.0,
+    "session_start": 1749999950.0,
+    "best_ts": 1750000005.5,
+    "score": 0.91,
+    "face_score": 0.88,
+    "person_score": 0.93,
+    "activity_score": 0.4,
+    "box": [0.1, 0.1, 0.2, 0.2],
+    "best_box": [0.1, 0.1, 0.2, 0.2],
+    "people_count": 1,
+    "camera_id": "home-camera",
+    "clip_start": 1750000000.0,
+    "clip_end": 1750000015.5,
+    "clip_bytes": 100,
+    "codec": "H264",
+    "source": "board_high_ring",
+}
+VIDEO_BYTES = b"\x00\x00\x00\x01\x67" + bytes(range(200)) + b"\r\n"
+
+
+def build_multipart(meta, video=VIDEO_BYTES, filename="clip.h264") -> bytes:
+    head_meta = (
+        f"--{BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="meta"\r\n'
+        "Content-Type: application/json\r\n\r\n"
+    )
+    meta_body = json.dumps(meta).encode("utf-8")
+    head_video = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="video"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    )
+    tail = f"\r\n--{BOUNDARY}--\r\n".encode("utf-8")
+    return (
+        head_meta.encode("utf-8")
+        + meta_body
+        + b"\r\n"
+        + head_video.encode("utf-8")
+        + video
+        + tail
+    )
+
+
+def test_parse_multipart_roundtrip():
+    body = build_multipart(SAMPLE_META)
+    parts = parse_multipart(body, BOUNDARY)
+    assert [part.name for part in parts] == ["meta", "video"]
+    meta_part, video_part = parts
+    assert meta_part.filename is None
+    assert video_part.filename == "clip.h264"
+    assert video_part.data == VIDEO_BYTES
+
+
+def test_parse_multipart_preserves_crlf_tail():
+    """文件部分以 \r\n 结尾的二进制不会被误截。"""
+    video_trailing = VIDEO_BYTES + b"\r\n"
+    body = build_multipart(SAMPLE_META, video=video_trailing)
+    parts = parse_multipart(body, BOUNDARY)
+    assert parts[1].data == video_trailing
+
+
+def test_parse_multipart_rejects_bad_body():
+    with pytest.raises(ValueError):
+        parse_multipart(b"garbage", BOUNDARY)
+    with pytest.raises(ValueError):
+        parse_multipart(b"--dwclip-boundary\r\n", "other-boundary")
+
+
+def test_validate_meta():
+    ok, err = validate_meta(dict(SAMPLE_META))
+    assert ok is not None and err is None
+
+    missing = dict(SAMPLE_META)
+    del missing["clip_start"]
+    assert validate_meta(missing)[1] is not None
+
+    bad_ts = dict(SAMPLE_META, clip_start="nan")
+    assert validate_meta(bad_ts)[1] is not None
+
+    assert validate_meta("string")[1] is not None
+
+
+def test_event_key_stability():
+    a = ingest_event_key(dict(SAMPLE_META))
+    b = ingest_event_key(dict(SAMPLE_META))
+    assert a == b
+    c = ingest_event_key(dict(SAMPLE_META, clip_end=16.0))
+    assert c != a
+
+
+def test_spool_roundtrip(tmp_path):
+    settings = replace(load_settings("/nonexistent.env"), board_ingest_dir=tmp_path / "spool")
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
+    assert job_dir.is_dir()
+    assert spool.job_meta(job_dir)["identity"] == "confirmed"
+    assert spool.job_video_path(job_dir, dict(SAMPLE_META)).read_bytes() == VIDEO_BYTES
+    assert spool.pending_count() == 1
+    spool.remove(job_dir)
+    assert spool.pending_count() == 0
+
+
+def test_spool_fail_moves_to_failed(tmp_path):
+    settings = replace(load_settings("/nonexistent.env"), board_ingest_dir=tmp_path / "spool")
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
+    spool.fail(job_dir)
+    assert (spool.failed_dir / job_dir.name).is_dir()
+    assert spool.pending_count() == 0
+
+
+def _make_settings(tmp_path, ingest=True):
+    return replace(
+        load_settings("/nonexistent.env"),
+        data_dir=tmp_path / "var",
+        output_dir=tmp_path / "out",
+        board_ingest_enabled=ingest,
+        board_ingest_dir=tmp_path / "spool",
+        database_path=tmp_path / "app.sqlite3",
+    )
+
+
+def test_save_ingested_clip_publishes_moment(tmp_path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
+
+    async def fake_remux(settings_, input_path, output_path, *, es_format=None):
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+
+    async def run_once():
+        return await save_ingested_clip(settings, database, spool, job_dir)
+
+    moment_id = asyncio.run(run_once())
+    assert moment_id is not None
+    assert not job_dir.exists()  # 处理后清理 spool
+
+    moment = database.get_moment(moment_id)
+    assert moment is not None
+    clip_path = Path(moment["clip_path"])
+    assert clip_path.exists()
+    assert clip_path.read_bytes() == VIDEO_BYTES
+    metadata = json.loads(Path(moment["metadata_path"]).read_text())
+    assert metadata["source"] == "board_high_ring"
+    assert metadata["analysis_backend"] == "rv1106_edge"
+    assert metadata["event_key"] == ingest_event_key(SAMPLE_META)
+
+    # 每日 manifest 已重建
+    day = clip_path.parent.name
+    manifest = json.loads((settings.output_dir / day / "manifest.json").read_text())
+    assert manifest["clip_count"] == 1
+
+    # 幂等: DB 已有 event_key -> 直接复用 moment, 不再重复入库
+    second_job = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
+    moment_id_again = asyncio.run(save_ingested_clip(settings, database, spool, second_job))
+    assert moment_id_again == moment_id
+    assert database.count_ingested_done() == 1
+
+
+def test_save_ingested_clip_records_error(tmp_path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
+
+    async def failing_remux(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", failing_remux)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="boom"):
+            await save_ingested_clip(settings, database, spool, job_dir)
+
+    asyncio.run(run())
+    assert job_dir.exists()  # 失败留队
+    assert database.record_ingested_error(job_dir.name, "boom") == 1
+    assert database.count_pending_ingested_clips() == 1
+
+
+def _ingest_handler(settings, database):
+    handler = object.__new__(RequestHandler)
+    handler.state = AppState(settings, database, Supervisor(settings, database))
+    handler.headers = {}
+    handler.rfile = BytesIO()
+    handler.wfile = BytesIO()
+    status = []
+    headers = {}
+    handler.send_response = lambda value: status.append(value)
+    handler.send_header = lambda name, value: headers.__setitem__(name, value)
+    handler.end_headers = lambda: None
+    stored = {}
+    handler._send_json = lambda payload, status=None, **kw: stored.update(
+        {"payload": payload, "status": status}
+    )
+    handler._send_error_json = lambda status, message, **kw: stored.update(
+        {"error": (status, message)}
+    )
+    return handler, stored
+
+
+def test_ingest_endpoint_disabled(tmp_path):
+    settings = load_settings("/nonexistent.env")
+    database = Database(tmp_path / "db.sqlite3")
+    database.migrate()
+    handler, stored = _ingest_handler(settings, database)
+    handler._handle_board_ingest()
+    assert stored["error"][0].value == 404
+
+
+def test_ingest_endpoint_rejects_bad_multipart(tmp_path):
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.migrate()
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = {
+        "Content-Type": "multipart/form-data; boundary=xx",
+        "Content-Length": "5",
+    }
+    handler.rfile = BytesIO(b"garbage")
+    handler._handle_board_ingest()
+    assert stored["error"][0].value == 400
+
+
+def test_ingest_endpoint_accepts_and_dedupes(tmp_path):
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.migrate()
+    body = build_multipart(SAMPLE_META)
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": str(len(body)),
+    }
+
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = headers
+    handler.rfile = BytesIO(body)
+    handler._handle_board_ingest()
+    assert stored["status"].value == 202
+    assert stored["payload"]["accepted"] is True
+    jobs = list((settings.board_ingest_dir / "pending").iterdir())
+    assert len(jobs) == 1
+
+    # 同一片段重复上传 -> 只落盘一次
+    handler2, stored2 = _ingest_handler(settings, database)
+    handler2.headers = headers
+    handler2.rfile = BytesIO(body)
+    handler2._handle_board_ingest()
+    assert stored2["payload"]["duplicate"] is True
+    assert len(list((settings.board_ingest_dir / "pending").iterdir())) == 1
+
+
+def test_ingest_endpoint_too_large(tmp_path):
+    settings = replace(
+        _make_settings(tmp_path), board_ingest_max_bytes=len(VIDEO_BYTES) - 10
+    )
+    database = Database(settings.database_path)
+    database.migrate()
+    body = build_multipart(SAMPLE_META)
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": str(len(body)),
+    }
+    handler.rfile = BytesIO(body)
+    handler._handle_board_ingest()
+    assert stored["error"][0].value == 413

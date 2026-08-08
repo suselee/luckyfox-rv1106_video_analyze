@@ -34,6 +34,7 @@ FreeBSD-jail Python service that saves family moments from RTSP cameras. Two sup
 - Analysis backends (`ANALYSIS_BACKEND`): `vlm` (llama.cpp, default), `daughter_detector` (fully local OpenCV, `daughter_detector.py`), `rv1106` (no NAS inference; MQTT-triggered only).
 - `person_filter.py` — optional local OpenCV pre-filter (skips no-person / confidently adult-only segments before any LLM call); downloads model weights on first use.
 - `mqtt.py` — hand-rolled stdlib MQTT subscriber (no paho); the NAS is a subscriber, never a broker.
+- `ingest.py` — hand-rolled multipart parser + filesystem spool queue (`BOARD_INGEST_DIR`) + `save_ingested_clip` (remux `-c copy` → Nextcloud layout) for board-uploaded 4K clips (`POST /api/ingest`); idempotent via `ingested_clips` table. See `docs/board-ingest.md`.
 - `archive.py` — rebuilds per-day `manifest.json` / `summary.md` / `_READY.json` markers from the DB.
 - `ffmpeg_tools.py` — all video/audio work (recording, sampling, contact sheets, person-filtered frame selection, clip extract/concat).
 - `llm.py` — sync `urllib` client to llama.cpp `/chat/completions` (wrapped in `asyncio.to_thread`), base64 images, circuit breaker on repeated timeouts.

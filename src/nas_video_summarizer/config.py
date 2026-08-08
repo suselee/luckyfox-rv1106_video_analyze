@@ -229,6 +229,10 @@ class Settings:
     mqtt_status_topic: str
     mqtt_client_id: str
     mqtt_keepalive_seconds: int
+    board_ingest_enabled: bool
+    board_ingest_dir: Path
+    board_ingest_max_bytes: int
+    board_ingest_max_attempts: int
     rv1106_session_timeout_seconds: float
     rv1106_save_wait_seconds: float
     rv1106_probable_policy: str
@@ -383,6 +387,12 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ).strip(),
         mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "nas-video").strip(),
         mqtt_keepalive_seconds=_int("MQTT_KEEPALIVE_SECONDS", 30),
+        board_ingest_enabled=_bool("BOARD_INGEST_ENABLED", False),
+        board_ingest_dir=_path(
+            "BOARD_INGEST_DIR", str(data_dir / "board_ingest")
+        ),
+        board_ingest_max_bytes=_int("BOARD_INGEST_MAX_BYTES", 64 * 1024 * 1024),
+        board_ingest_max_attempts=_int("BOARD_INGEST_MAX_ATTEMPTS", 3),
         rv1106_session_timeout_seconds=_float(
             "RV1106_SESSION_TIMEOUT_SECONDS", 20.0
         ),
@@ -416,5 +426,6 @@ def ensure_directories(settings: Settings) -> None:
         settings.low_buffer_dir,
         settings.high_buffer_dir,
         settings.person_filter_model_dir,
+        settings.board_ingest_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

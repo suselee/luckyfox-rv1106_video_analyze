@@ -192,6 +192,25 @@ def build_checks(settings: Settings) -> list[Check]:
             ),
             required=settings.mqtt_enabled,
         ),
+        Check(
+            "board ingest",
+            not settings.board_ingest_enabled
+            or (
+                _path_writable(settings.board_ingest_dir)
+                and settings.board_ingest_max_bytes > 0
+                and 0 < settings.board_ingest_max_attempts <= 10
+            ),
+            (
+                "disabled"
+                if not settings.board_ingest_enabled
+                else (
+                    f"{settings.board_ingest_dir}, "
+                    f"{settings.board_ingest_max_bytes} B, "
+                    f"{settings.board_ingest_max_attempts} attempts"
+                )
+            ),
+            required=settings.board_ingest_enabled,
+        ),
         _person_filter_check(settings),
         _daughter_detector_check(settings),
     ]

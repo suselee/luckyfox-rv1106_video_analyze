@@ -16,6 +16,12 @@ from urllib.parse import parse_qs, urlparse
 from .archive import rebuild_day_archive
 from .config import Settings, ensure_directories, load_settings
 from .database import Database
+from .ingest import (
+    IngestSpool,
+    ingest_event_key,
+    parse_multipart,
+    validate_meta,
+)
 from .workers import Supervisor, health_snapshot
 
 
@@ -189,6 +195,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/ingest":
+            self._handle_board_ingest()
+            return
         moment_id = _moment_id_from_path(path, "/favorite")
         if moment_id is None:
             self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
@@ -208,6 +217,80 @@ class RequestHandler(BaseHTTPRequestHandler):
         favorited = bool(payload.get("favorited", not moment["favorited"]))
         self.state.database.set_favorite(moment_id, favorited)
         self._send_json({"id": moment_id, "favorited": favorited})
+
+    def _handle_board_ingest(self) -> None:
+        """接收 RV1106 板端 multipart 上传 (meta JSON + 4K 基本流片段)。"""
+        settings = self.state.settings
+        if not settings.board_ingest_enabled:
+            self._send_error_json(HTTPStatus.NOT_FOUND, "board ingest disabled")
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        boundary = None
+        for token in content_type.split(";"):
+            key, _, value = token.strip().partition("=")
+            if key.lower() == "boundary":
+                boundary = value.strip().strip('"')
+                break
+        if not boundary:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "missing multipart boundary")
+            return
+
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "missing Content-Length")
+            return
+        if length > settings.board_ingest_max_bytes:
+            self._send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"upload exceeds {settings.board_ingest_max_bytes} bytes",
+            )
+            return
+
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "short body")
+            return
+
+        try:
+            parts = parse_multipart(raw, boundary)
+        except ValueError as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        meta_part = next((part for part in parts if part.name == "meta"), None)
+        video_part = next(
+            (part for part in parts if part.name == "video" and part.filename),
+            None,
+        )
+        if meta_part is None or video_part is None:
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "multipart must contain meta and video parts"
+            )
+            return
+
+        try:
+            meta, meta_error = validate_meta(json.loads(meta_part.data.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "meta is not valid JSON")
+            return
+        if meta is None:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, meta_error or "invalid meta")
+            return
+
+        event_key = ingest_event_key(meta)
+        existing = self.state.database.ingested_moment_id(event_key)
+        spool = IngestSpool(settings)
+        if existing is not None or (spool.pending_dir / event_key).exists():
+            self._send_json(
+                {"accepted": True, "duplicate": True, "event_key": event_key}
+            )
+            return
+
+        spool.spool(meta, video_part.data)
+        self._send_json(
+            {"accepted": True, "duplicate": False, "event_key": event_key},
+            status=HTTPStatus.ACCEPTED,
+        )
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
