@@ -18,6 +18,7 @@
 #include "face_detect.h"
 #include "face_recog.h"
 #include "h264_source.h"
+#include "high_stream.h"
 #include "mpp_decoder.h"
 #include "mqtt_publisher.h"
 #include "rockiva_detector.h"
@@ -29,6 +30,8 @@ using namespace dw;
 
 static volatile int g_running = 1;
 static void on_signal(int) { g_running = 0; }
+
+static HighStream* g_high = NULL;  // 4K 高码流链路 (可选)
 
 static double now_seconds() {
     struct timeval tv;
@@ -188,6 +191,8 @@ static void publish_fusion_events(
                events[i].event.c_str(), events[i].track_id,
                events[i].identity.c_str(), events[i].score,
                sent ? "OK" : "FAIL");
+        // 高码流链路: 板端直接从 4K 环形缓冲切片段上传 NAS (新建通道)
+        if (g_high) g_high->enqueue_event(events[i]);
     }
 }
 
@@ -307,6 +312,37 @@ int main(int argc, char* argv[]) {
     if (!mqtt.connect(mqtt_host, mqtt_port, mqtt_cid, mqtt_user, mqtt_pass))
         printf("[WARN] MQTT initial connection failed; publish will retry\n");
 
+    // ---- 4K 高码流链路 (环形缓冲 + 切片上传) ----
+    HighStream* high = NULL;
+    HighStreamConfig high_cfg;
+    high_cfg.rtsp_url = cfg.get("high.url");
+    high_cfg.ring_mb = (size_t)cfg.get_int("high.ring_mb", 64);
+    high_cfg.upload_url = cfg.get("upload.url");
+    high_cfg.upload_probable = cfg.get_bool("high.upload_probable", false);
+    high_cfg.context_before = cfg.get_double("upload.context_before_seconds", 5.0);
+    high_cfg.context_after = cfg.get_double("upload.context_after_seconds", 10.0);
+    high_cfg.max_clip_seconds = cfg.get_double("upload.max_clip_seconds", 90.0);
+    high_cfg.min_clip_seconds = cfg.get_double("upload.min_clip_seconds", 3.0);
+    high_cfg.gap_limit = cfg.get_double("upload.gap_limit_seconds", 2.5);
+    high_cfg.max_retries = cfg.get_int("upload.max_retries", 3);
+    high_cfg.retry_delay = cfg.get_double("upload.retry_delay_seconds", 5.0);
+    high_cfg.upload_timeout = cfg.get_double("upload.upload_timeout_seconds", 30.0);
+    high_cfg.max_queue = cfg.get_int("upload.max_queue", 8);
+    high_cfg.camera_id = camera_id;
+    if (!high_cfg.rtsp_url.empty() && !high_cfg.upload_url.empty()) {
+        high_cfg.enabled = true;
+        high = new HighStream(high_cfg);
+        if (high->start()) {
+            g_high = high;
+            printf("[INIT] high-stream enabled: ring=%zuMB upload=%s\n",
+                   high_cfg.ring_mb, high_cfg.upload_url.c_str());
+        } else {
+            delete high;
+            high = NULL;
+            printf("[WARN] high-stream failed to start; MQTT-only mode\n");
+        }
+    }
+
     H264Source src;
     MppDecoder decoder(rtsp_w, rtsp_h);
     bool stream_active = false;
@@ -369,6 +405,10 @@ int main(int argc, char* argv[]) {
                     decoder.deinit();
                 }
                 stream_active = false;
+                if (g_high) {
+                    g_high->stop();
+                    printf("[SCHEDULE] high-stream stopped\n");
+                }
                 reconnect_wait = 2;
                 last_health = -1e9;
                 printf("[SCHEDULE] active window ended; RTSP and decoder stopped\n");
@@ -376,7 +416,10 @@ int main(int argc, char* argv[]) {
             if (loop_now - last_health >= 60.0) {
                 last_health = loop_now;
                 SystemStats stats = monitor.sample();
-                char status[1536];
+                char high_json[2048];
+                high_json[0] = '\0';
+                if (g_high) g_high->status_json(high_json, sizeof(high_json));
+                char status[2048];
                 snprintf(status, sizeof(status),
                          "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"sleeping\","
                          "\"schedule_active\":false,\"active_window_start\":\"%s\","
@@ -387,12 +430,13 @@ int main(int argc, char* argv[]) {
                          "\"active_tracks\":0,\"confirmed_tracks\":0,"
                          "\"probable_tracks\":0,\"confirmed_sessions\":%d,"
                          "\"decoded_frames\":%ld,\"scanned_frames\":%ld,"
-                         "\"rtsp_reconnects\":%ld}",
+                         "\"rtsp_reconnects\":%ld%s}",
                          loop_now, camera_id.c_str(), schedule_start_text.c_str(),
                          schedule_end_text.c_str(), schedule.utc_offset_minutes,
                          stats.cpu_percent, stats.available_memory_kb / 1024.0,
                          stats.temperature_c, fusion.confirmed_sessions(),
-                         decoded_frames, scanned_frames, reconnects);
+                         decoded_frames, scanned_frames, reconnects,
+                         high_json);
                 if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
                 printf("[HEALTH] sleeping cpu=%.1f%% mem=%.1fMB temp=%.1fC\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,
@@ -414,6 +458,10 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             stream_active = true;
+            if (g_high) {
+                if (!g_high->running()) g_high->start();
+                printf("[SCHEDULE] high-stream (re)started\n");
+            }
             reconnect_wait = 2;
             last_scan = -1e9;
             last_face_fallback = -1e9;
@@ -596,7 +644,10 @@ int main(int argc, char* argv[]) {
                 SystemStats stats = monitor.sample();
                 double p95 = SystemMonitor::percentile95(detector_latencies);
                 int level = guard.update(stats, p95);
-                char status[2048];
+                char high_json[2048];
+                high_json[0] = '\0';
+                if (g_high) g_high->status_json(high_json, sizeof(high_json));
+                char status[3072];
                 snprintf(status, sizeof(status),
                          "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"%s\","
                          "\"schedule_active\":true,\"active_window_start\":\"%s\","
@@ -613,7 +664,7 @@ int main(int argc, char* argv[]) {
                          "\"similarity_samples\":%llu,\"max_face_similarity\":%.4f,"
                          "\"face_threshold_hits\":%llu,\"face_high_threshold_hits\":%llu,"
                          "\"decoded_frames\":%ld,"
-                         "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld}",
+                         "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld%s}",
                           now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
                           schedule_start_text.c_str(), schedule_end_text.c_str(),
                           schedule.utc_offset_minutes,
@@ -627,7 +678,7 @@ int main(int argc, char* argv[]) {
                           eligible_face_detections, face_track_matches,
                           embedding_successes, similarity_samples,
                           max_face_similarity, threshold_hits, high_threshold_hits,
-                          decoded_frames, scanned_frames, reconnects);
+                          decoded_frames, scanned_frames, reconnects, high_json);
                 if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
                 printf("[HEALTH] cpu=%.1f%% mem=%.1fMB temp=%.1fC p95=%.1fms guard=%d\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,
@@ -643,6 +694,11 @@ int main(int argc, char* argv[]) {
         mqtt, hit_topic, mqtt_qos, camera_id, sequence, ending,
         rtsp_w, rtsp_h,
         fusion_enabled ? "rockiva_fusion_v1" : "face_only");
+    if (g_high) {
+        g_high->stop();
+        delete g_high;
+        g_high = NULL;
+    }
     src.close();
     decoder.deinit();
     mqtt.disconnect();

@@ -7,13 +7,17 @@ namespace dw {
 
 // 原生 RTSP/RTP 客户端, 零外部依赖, 仅用 POSIX socket。
 // TCP 直连摄像头 → RTSP 握手 (OPTIONS/DESCRIBE/SETUP/PLAY)
-// → 接收 RTP interleaved H.264 → 解封装为 Annex-B → 输出给 MPP 硬解。
+// → 接收 RTP interleaved H.264/H.265 → 解封装为 Annex-B → 输出。
+// 类名保持 H264Source 兼容旧调用方; 实际码流由 SDP 决定 (codec() 可查)。
 class H264Source {
 public:
     ~H264Source();
 
     // rtsp_url 格式: rtsp://[user:pass@]host[:port]/path
     bool open(const std::string& rtsp_url);
+
+    // SDP 协商出的码流: "H264" 或 "H265"
+    const std::string& codec() const { return codec_; }
 
     // 非阻塞读取 Annex-B H.264 数据。返回 >0=字节数, 0=暂无数据, <0=错误/断线。
     int read_chunk(uint8_t* buf, int max_len);
@@ -52,6 +56,7 @@ private:
     // ---------- RTP/H.264 ----------
     int  read_rtp_packet(uint8_t* buf, int max_len);
     void depacketize_h264(const uint8_t* rtp_payload, int len);
+    void depacketize_h265(const uint8_t* rtp_payload, int len);
 
     // ---------- Annex-B 输出缓冲 ----------
     int  drain_outbuf(uint8_t* buf, int max_len);
@@ -64,6 +69,7 @@ private:
     // ---------- 字段 ----------
     int         sock_ = -1;
     std::string host_, path_, user_, pass_;
+    std::string codec_;                // "H264" / "H265" (SDP 协商结果)
     int         port_ = 554;
     std::string session_;
     int         cseq_    = 0;

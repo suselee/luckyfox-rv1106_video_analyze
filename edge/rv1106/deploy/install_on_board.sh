@@ -24,13 +24,13 @@ done
 [ -e "$INIT_SCRIPT" ] && cp -p "$INIT_SCRIPT" "$ROLLBACK_DIR/S98daughter_watch"
 
 mkdir -p "$APP_DIR/models/rockiva"
-cp -p "$PACKAGE_DIR/rockiva_probe" "$PACKAGE_DIR/track_fusion_test" "$PACKAGE_DIR/schedule_test" "$APP_DIR/"
+cp -p "$PACKAGE_DIR/rockiva_probe" "$PACKAGE_DIR/high_stream_probe" "$PACKAGE_DIR/track_fusion_test" "$PACKAGE_DIR/schedule_test" "$APP_DIR/"
 cp -p "$PACKAGE_DIR/librockiva.so" "$APP_DIR/"
 cp -p "$PACKAGE_DIR/rollback_on_board.sh" "$APP_DIR/rollback_on_board.sh"
 cp -p "$PACKAGE_DIR/models/rockiva/object_detection_pfp.data" "$APP_DIR/models/rockiva/"
 cp -p "$PACKAGE_DIR/models/face_detector.rknn" "$PACKAGE_DIR/models/mobilefacenet.rknn" "$APP_DIR/models/"
 [ -e "$APP_DIR/models/daughter.db" ] || cp -p "$PACKAGE_DIR/models/daughter.db" "$APP_DIR/models/daughter.db"
-chmod +x "$APP_DIR/rockiva_probe" "$APP_DIR/track_fusion_test" "$APP_DIR/schedule_test" "$APP_DIR/rollback_on_board.sh"
+chmod +x "$APP_DIR/rockiva_probe" "$APP_DIR/high_stream_probe" "$APP_DIR/track_fusion_test" "$APP_DIR/schedule_test" "$APP_DIR/rollback_on_board.sh"
 
 export LD_LIBRARY_PATH="$APP_DIR:/oem/usr/lib:${LD_LIBRARY_PATH:-}"
 "$APP_DIR/track_fusion_test"

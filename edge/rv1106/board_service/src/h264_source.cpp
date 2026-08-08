@@ -328,11 +328,12 @@ bool H264Source::rtsp_handshake() {
                body.size());
         return false;
     }
-    if (codec != "H264") {
-        printf("[RTSP] unsupported video codec: %s (need H264)\n",
+    if (codec != "H264" && codec != "H265") {
+        printf("[RTSP] unsupported video codec: %s (need H264/H265)\n",
                codec.empty() ? "unknown" : codec.c_str());
         return false;
     }
+    codec_ = codec;
 
     std::string content_base = hdr_val(hdrs, "Content-Base");
     if (content_base.empty()) content_base = hdr_val(hdrs, "Content-Location");
@@ -456,6 +457,59 @@ void H264Source::depacketize_h264(const uint8_t* payload, int len) {
     // 其他 NAL 类型 (0, 25-31) 忽略
 }
 
+// RFC 7798 HEVC RTP 解封装。
+// 16-bit payload header: [F(1)][Type(6)][LayerId(6)][TID(3)]
+// 假设无 DONL 字段 (sprop-max-don-diff=0, 绝大多数编码器如此)。
+void H264Source::depacketize_h265(const uint8_t* payload, int len) {
+    if (len < 2) return;
+    uint8_t type = (payload[0] >> 1) & 0x3F;
+
+    if (type < 48) {
+        // 单 NAL 单元 (0~47): payload header 即 NAL header
+        append_nal(payload, len);
+    } else if (type == 48) {
+        // AP (聚合包): 2 字节 payload header 后是 [2B size + NAL] 序列
+        int off = 2;
+        while (off + 2 <= len) {
+            uint16_t sz = ((uint16_t)payload[off] << 8) | payload[off + 1];
+            off += 2;
+            if (off + sz > len) break;
+            append_nal(payload + off, sz);
+            off += sz;
+        }
+    } else if (type == 49) {
+        // FU: 2 字节 payload header + 1 字节 FU header [S(1)][E(1)][FuType(6)]
+        if (len < 3) return;
+        uint8_t fu_hdr  = payload[2];
+        bool    start   = (fu_hdr & 0x80) != 0;
+        bool    end     = (fu_hdr & 0x40) != 0;
+        uint8_t fu_type = fu_hdr & 0x3F;
+
+        if (start) {
+            frag_.buf.clear();
+            // 重构原始 NAL header:
+            // byte0 = F(来自 payload[0]) | FuType | LayerId LSB
+            // byte1 = LayerId 高 5 位 | TID (即原 payload[1], 不变)
+            uint8_t b0 = (payload[0] & 0x80) | (uint8_t)(fu_type << 1) |
+                         (payload[0] & 0x01);
+            frag_.buf.push_back(b0);
+            frag_.buf.push_back(payload[1]);
+            frag_.active   = true;
+            frag_.nal_type = fu_type;
+        }
+        if (!frag_.active || (frag_.nal_type & 0xFF) != fu_type) {
+            frag_.active = false;
+            return;
+        }
+        frag_.buf.insert(frag_.buf.end(), payload + 3, payload + len);
+        if (end) {
+            append_nal(frag_.buf.data(), (int)frag_.buf.size());
+            frag_.buf.clear();
+            frag_.active = false;
+        }
+    }
+}
+
 // ---- 公共接口 ----------------------------------------------------------------
 int H264Source::drain_outbuf(uint8_t* buf, int max_len) {
     int avail = (int)out_buf_.size() - out_off_;
@@ -525,7 +579,10 @@ int H264Source::read_chunk(uint8_t* buf, int max_len) {
     }
     if (payload_end <= header_len) return 0;
 
-    depacketize_h264(buf + header_len, payload_end - header_len);
+    if (codec_ == "H265")
+        depacketize_h265(buf + header_len, payload_end - header_len);
+    else
+        depacketize_h264(buf + header_len, payload_end - header_len);
     return drain_outbuf(buf, max_len);
 }
 
