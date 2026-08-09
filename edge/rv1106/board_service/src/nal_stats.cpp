@@ -42,6 +42,9 @@ void NalStats::on_nal(const uint8_t* nal, size_t len, double ts) {
     nals++;
     bytes += (unsigned long long)len;
 
+    if (last_data_ts >= 0 && ts - last_data_ts > 3.0) gaps++;
+    last_data_ts = ts;
+
     uint8_t type = 0;
     if (*codec == "H265") {
         if (len >= 2) type = (uint8_t)((nal[0] >> 1) & 0x3F);
@@ -51,7 +54,7 @@ void NalStats::on_nal(const uint8_t* nal, size_t len, double ts) {
     NalKind kind = classify_nal(*codec, type);
 
     if (kind.key) {
-        if (last_key_ts > 0) gop_secs.push_back(ts - last_key_ts);
+        if (last_key_ts >= 0) gop_secs.push_back(ts - last_key_ts);
         last_key_ts = ts;
         key_count++;
     }

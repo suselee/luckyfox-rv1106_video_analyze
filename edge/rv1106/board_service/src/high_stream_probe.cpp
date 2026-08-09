@@ -78,9 +78,6 @@ int main(int argc, char* argv[]) {
         }
         if (n > 0) {
             reconnect_wait = 2;
-            if (stats.last_data_ts > 0 && now - stats.last_data_ts > 3.0)
-                stats.gaps++;
-            stats.last_data_ts = now;
             stats.window_bytes += (unsigned long long)n;
             scanner.feed(chunk.data(), (size_t)n, now);
         }
