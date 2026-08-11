@@ -52,6 +52,7 @@ struct FaceRoi {
     uint32_t track_id;
     float x1, y1, x2, y2;
     bool rockiva_anchored;
+    bool full_frame;
 };
 
 // Crop the region out of the full RGB frame, run RetinaFace on the crop
@@ -309,6 +310,8 @@ int main(int argc, char* argv[]) {
     int max_face_rois = cfg.get_int("pipeline.max_face_rois_per_scan", 2);
     float face_roi_margin = (float)cfg.get_double("pipeline.face_roi_margin", 0.50);
     float head_roi_ratio = (float)cfg.get_double("pipeline.head_roi_ratio", 0.55);
+    double full_frame_fps = cfg.get_double("pipeline.full_frame_scan_fps", 1.0);
+    double full_frame_interval = full_frame_fps > 0 ? 1.0 / full_frame_fps : 1e9;
 
     MqttPublisher mqtt;
     if (!mqtt.connect(mqtt_host, mqtt_port, mqtt_cid, mqtt_user, mqtt_pass))
@@ -384,6 +387,8 @@ int main(int argc, char* argv[]) {
     double last_face_fallback = -1e9;
     double last_face_hit = -1e9;
     double last_health = -1e9;
+    double last_dbg = -1e9;
+    double last_full_frame_scan = -1e9;
     int reconnect_wait = 2;
 
     printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
@@ -532,6 +537,38 @@ int main(int argc, char* argv[]) {
                 fusion.observe(now, objects);
                 rockiva_face_detections += objects.faces.size();
 
+                if (now - last_dbg >= 10.0) {
+                    last_dbg = now;
+                    std::vector<TrackSnapshot> dbg_snaps = fusion.snapshot(now);
+                    int child_like = 0;
+                    for (size_t i = 0; i < dbg_snaps.size(); ++i)
+                        if (dbg_snaps[i].child_like) child_like++;
+                    int overlap = 0;
+                    for (size_t i = 0; i < objects.faces.size(); ++i) {
+                        const IvaObject& f = objects.faces[i];
+                        float cx = (f.x1 + f.x2) * 0.5f;
+                        float cy = (f.y1 + f.y2) * 0.5f;
+                        if (fusion.track_for_face(cx, cy)) overlap++;
+                    }
+                    printf("[DBG] t=%.1f iva_faces=%zu persons=%zu tracks=%zu child_like=%d iva_overlap=%d\n",
+                           now, objects.faces.size(), objects.people.size(),
+                           dbg_snaps.size(), child_like, overlap);
+                    for (size_t i = 0; i < objects.faces.size() && i < 3; ++i) {
+                        const IvaObject& f = objects.faces[i];
+                        printf("[DBG]   iva_face#%zu box=(%.3f,%.3f,%.3f,%.3f) size=%dx%dpx score=%.2f\n",
+                               i, f.x1, f.y1, f.x2, f.y2,
+                               (int)((f.x2 - f.x1) * frame.width()),
+                               (int)((f.y2 - f.y1) * frame.height()), f.score);
+                    }
+                    for (size_t i = 0; i < objects.people.size() && i < 2; ++i) {
+                        const IvaObject& p = objects.people[i];
+                        printf("[DBG]   person#%zu box=(%.3f,%.3f,%.3f,%.3f) size=%dx%dpx score=%.2f\n",
+                               i, p.x1, p.y1, p.x2, p.y2,
+                               (int)((p.x2 - p.x1) * frame.width()),
+                               (int)((p.y2 - p.y1) * frame.height()), p.score);
+                    }
+                }
+
                 // Schedule recognition jobs: RockIVA face boxes anchored to
                 // tracks first (precise attribution, works even when the
                 // child is held), then head regions of due child-like tracks.
@@ -551,6 +588,7 @@ int main(int argc, char* argv[]) {
                     job.x1 = iva_face.x1; job.y1 = iva_face.y1;
                     job.x2 = iva_face.x2; job.y2 = iva_face.y2;
                     job.rockiva_anchored = true;
+                    job.full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(track);
                 }
@@ -567,13 +605,42 @@ int main(int argc, char* argv[]) {
                     job.x2 = snap.box.x2;
                     job.y2 = snap.box.y1 + (snap.box.y2 - snap.box.y1) * head_roi_ratio;
                     job.rockiva_anchored = false;
+                    job.full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(snap.id);
                 }
 
-                if (!jobs.empty()) {
+                double full_frame_due = now - last_full_frame_scan >= full_frame_interval;
+                if (!jobs.empty() || full_frame_due) {
                     face_scan_attempts++;
                     if (frame.to_rgb(rgb)) {
+                        // 全帧 retinaface 扫描: 不依赖 child_like 判定与头部 ROI,
+                        // 覆盖"人很近、脸最大"的时刻; 命中轨迹后与 ROI 任务同路径处理。
+                        if (full_frame_due) {
+                            last_full_frame_scan = now;
+                            std::vector<FaceBox> all_faces = face_detector.detect(
+                                rgb.data(), frame.width(), frame.height(), det_score);
+                            for (size_t i = 0; i < all_faces.size(); ++i) {
+                                const FaceBox& f = all_faces[i];
+                                if ((f.x2 - f.x1) * frame.width() < min_face ||
+                                    (f.y2 - f.y1) * frame.height() < min_face)
+                                    continue;
+                                float cx = (f.x1 + f.x2) * 0.5f;
+                                float cy = (f.y1 + f.y2) * 0.5f;
+                                uint32_t track = fusion.track_for_face(cx, cy);
+                                if (!track || !fusion.should_check_face(track, now)) continue;
+                                if (std::find(roi_tracks.begin(), roi_tracks.end(), track) != roi_tracks.end())
+                                    continue;
+                                FaceRoi job;
+                                job.track_id = track;
+                                job.x1 = f.x1; job.y1 = f.y1;
+                                job.x2 = f.x2; job.y2 = f.y2;
+                                job.rockiva_anchored = false;
+                                job.full_frame = true;
+                                jobs.push_back(job);
+                                roi_tracks.push_back(track);
+                            }
+                        }
                         int budget = max_face_rois;
                         for (size_t i = 0; i < jobs.size() && budget > 0; ++i, --budget) {
                             const FaceRoi& job = jobs[i];
@@ -591,11 +658,11 @@ int main(int argc, char* argv[]) {
                             if (face_w < min_face || face_h < min_face) continue;
                             eligible_face_detections++;
                             face_track_matches++;
+                            const char* roi_label = job.rockiva_anchored ? "iva"
+                                : (job.full_frame ? "full" : "head");
                             if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), face, embedding)) {
                                 printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d result=embedding-failed\n",
-                                       now, job.track_id,
-                                       job.rockiva_anchored ? "iva" : "head",
-                                       face.score, face_w, face_h);
+                                       now, job.track_id, roi_label, face.score, face_w, face_h);
                                 continue;
                             }
                             embedding_successes++;
@@ -605,8 +672,7 @@ int main(int argc, char* argv[]) {
                             if (similarity >= threshold) threshold_hits++;
                             if (similarity >= high_threshold) high_threshold_hits++;
                             printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d similarity=%.4f result=%s\n",
-                                   now, job.track_id,
-                                   job.rockiva_anchored ? "iva" : "head",
+                                   now, job.track_id, roi_label,
                                    face.score, face_w, face_h, similarity,
                                    similarity >= high_threshold ? "high-hit" :
                                    (similarity >= threshold ? "hit" : "below-threshold"));

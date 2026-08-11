@@ -148,10 +148,12 @@ bool FaceRecognizer::extract(const unsigned char* rgb, int img_w, int img_h,
                              const FaceBox& box, std::vector<float>& emb) {
     if (!inited_) return false;
 
+    // 直接裁剪+缩放, 不用关键点 warp 对齐:
+    // 本检测器关键点不稳定 (同图亮度/缩放变体关键点角度差 12-30 度),
+    // warp 会把关键点噪声放大进嵌入, 导致同人相似度坍缩 (实测 0.2-0.4)。
+    // 模型对裁剪输入鲁棒 (无对齐 fp32 同人 0.6-1.0)。
     std::vector<unsigned char> in((size_t)in_w_ * in_h_ * 3);
-    if (!align_face(rgb, img_w, img_h, box, in_w_, in_h_, in.data())) {
-        if (!crop_resize(rgb, img_w, img_h, box, in_w_, in_h_, in.data())) return false;
-    }
+    if (!crop_resize(rgb, img_w, img_h, box, in_w_, in_h_, in.data())) return false;
 
     rknn_model_set_input(&m_, in.data(), in_w_, in_h_, 3);
     if (rknn_run(m_.ctx, NULL) < 0) return false;

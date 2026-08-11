@@ -141,6 +141,12 @@ float* rknn_model_get_output_float(RknnModel* m, int idx) {
         const uint16_t* src = (const uint16_t*)m->output_mems[idx]->virt_addr;
         for (int i = 0; i < n_elems; i++)
             out[i] = (float)float16::fromBits(src[i]);
+    } else if (m->output_attrs[idx].type == RKNN_TENSOR_INT16) {
+        const int16_t* src = (const int16_t*)m->output_mems[idx]->virt_addr;
+        int    zp    = m->output_attrs[idx].zp;
+        float  scale = m->output_attrs[idx].scale;
+        for (int i = 0; i < n_elems; i++)
+            out[i] = (src[i] - zp) * scale;
     } else if (m->output_attrs[idx].type == RKNN_TENSOR_FLOAT32) {
         memcpy(out, m->output_mems[idx]->virt_addr, n_elems * sizeof(float));
     } else {
