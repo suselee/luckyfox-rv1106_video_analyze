@@ -266,12 +266,10 @@ async def save_ingested_clip(
     display_clip_end = clip_end_dt + display_offset
     day = display_clip_start.strftime("%Y-%m-%d")
 
-    if settings.max_moments_per_day:
-        count_day = database.count_moments_on_day(day)
-        if count_day >= settings.max_moments_per_day:
-            raise RuntimeError(
-                f"board ingest rejected: day cap {settings.max_moments_per_day} reached"
-            )
+    # 产品规则: 只有确认女儿在场的视频才保存 (板端 probable 事件不算数)。
+    if identity != "confirmed":
+        spool.remove(job_dir)
+        return None
 
     score = float(meta.get("score") or 0.5)
     activity_score = float(meta.get("activity_score") or 0.0)
@@ -296,6 +294,24 @@ async def save_ingested_clip(
     clip_path = _unique_path(day_dir / f"{display_clip_start.strftime('%H%M%S')}_{title_slug}.mp4")
     metadata_path = clip_path.with_suffix(".json")
 
+    # 每日上限: 超出时只有比当天最弱片段更强才允许保存, 并移除最弱片段
+    # (评分 = selection_score, 与 NAS 分析管线共用同一每日池)。
+    evict_moment = None
+    if settings.max_moments_per_day:
+        count_day = database.count_moments_on_day(day)
+        if count_day >= settings.max_moments_per_day:
+            weakest = database.weakest_moment_on_day(day)
+            weakest_score = (
+                float(weakest.get("selection_score") or weakest.get("confidence") or 0.0)
+                if weakest
+                else 0.0
+            )
+            if weakest and selection_score > weakest_score:
+                evict_moment = weakest
+            else:
+                spool.remove(job_dir)
+                return None
+
     day_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=".nas-video-staged-", dir=day_dir
@@ -308,6 +324,12 @@ async def save_ingested_clip(
             es_format=_es_format(meta.get("codec")),
         )
         os.replace(staged_clip_path, clip_path)
+
+    # 新片段已安全落盘; 现在移除被替换的当天最弱片段 (文件 + DB 记录)。
+    if evict_moment is not None:
+        for key in ("clip_path", "metadata_path"):
+            Path(evict_moment[key]).unlink(missing_ok=True)
+        database.delete_moment_record(evict_moment["id"])
 
     metadata = {
         "schema_version": 3,

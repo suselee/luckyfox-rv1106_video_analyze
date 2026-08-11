@@ -16,6 +16,7 @@ static FusionConfig test_config() {
     config.confirmed_ttl_seconds = 8;
     config.track_lost_seconds = 3;
     config.probable_hold_seconds = 3;
+    config.confirm_child_hold_seconds = 60;
     config.mqtt_update_seconds = 5;
     config.face_threshold = 0.35f;
     config.face_high_threshold = 0.55f;
@@ -142,6 +143,35 @@ int main() {
     assert(events.size() == 1 && events[0].event == "end");
     assert(overlap.active_tracks() == 0);
     assert(overlap.confirmed_sessions() == 1);
+
+    // 成人轨迹 (身高比超过 child_max) 低阈值命中两次不得确认: 避免保存
+    // 只有大人的画面。
+    TrackFusion adult(config);
+    adult.observe(0, one_person(1, 0.1f, 0.75f));
+    adult.apply_face_score(1, 0.40f, 1);
+    adult.apply_face_score(1, 0.40f, 2);
+    adult.observe(2.5, one_person(1, 0.1f, 0.75f));
+    assert(adult.collect_events(2.8).empty());
+    assert(adult.confirmed_sessions() == 0);
+    // 成人轨迹只有强相似度 (>= face_high_threshold) 才能确认。
+    adult.apply_face_score(1, 0.60f, 3);
+    adult.observe(3.5, one_person(1, 0.1f, 0.75f));
+    events = adult.collect_events(4);
+    assert(events.size() == 1 && events[0].event == "start");
+    assert(events[0].identity == "confirmed");
+
+    // 儿童轨迹在确认后身份衰减, end 事件仍携带 confirmed (确认过的会话
+    // 必须保存, 不能因 ttl 衰减丢失)。
+    TrackFusion decay(config);
+    decay.observe(0, one_person(1, 0.1f, 0.35f));
+    decay.apply_face_score(1, 0.60f, 1);
+    events = decay.collect_events(1);
+    assert(events.size() == 1 && events[0].identity == "confirmed");
+    decay.observe(20, one_person(1, 0.1f, 0.35f));
+    decay.observe(22, IvaResult());  // track lost shortly after
+    events = decay.collect_events(30);
+    assert(events.size() == 1 && events[0].event == "end");
+    assert(events[0].identity == "confirmed");
 
     fusion.observe(6, IvaResult());
     events = fusion.collect_events(9);

@@ -125,8 +125,9 @@ void HighStream::drain_events() {
 }
 
 void HighStream::make_clip(const FusionEvent& ev) {
-    bool do_cut = ev.event == "confirmed" ||
-                  (cfg_.upload_probable && ev.event == "probable");
+    bool do_cut = ev.event == "end" &&
+                  (ev.identity == "confirmed" ||
+                   (cfg_.upload_probable && ev.identity == "probable"));
     if (!do_cut) return;
 
     // 事件窗口: session 开始前 context_before, 峰值时刻后 context_after;

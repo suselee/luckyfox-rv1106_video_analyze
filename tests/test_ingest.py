@@ -303,3 +303,64 @@ def test_ingest_endpoint_too_large(tmp_path):
     handler.rfile = BytesIO(body)
     handler._handle_board_ingest()
     assert stored["error"][0].value == 413
+
+
+def _save_clip(tmp_path, monkeypatch, meta, settings=None, database=None):
+    settings = settings or _make_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = database or Database(settings.database_path)
+    database.migrate()
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(meta), VIDEO_BYTES)
+
+    async def fake_remux(settings_, input_path, output_path, *, es_format=None):
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+
+    moment_id = asyncio.run(save_ingested_clip(settings, database, spool, job_dir))
+    return moment_id, database, spool, job_dir
+
+
+def test_save_ingested_clip_skips_probable_identity(tmp_path, monkeypatch):
+    meta = dict(SAMPLE_META, session_id="9-9", identity="probable")
+    moment_id, database, spool, job_dir = _save_clip(tmp_path, monkeypatch, meta)
+    assert moment_id is None
+    assert not job_dir.exists()  # probable 上传直接清理, 不保存
+    assert database.count_moments_on_day("2025-06-15") == 0
+    assert database.count_ingested_done() == 0
+
+
+def test_save_ingested_clip_daily_cap_replaces_weakest(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), max_moments_per_day=1)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    weak_meta = dict(SAMPLE_META, session_id="1-1", score=0.5, face_score=0.1)
+    strong_meta = dict(SAMPLE_META, session_id="2-2", score=0.9, face_score=0.8)
+
+    weak_id, database, _, _ = _save_clip(tmp_path, monkeypatch, weak_meta, settings, database)
+    assert weak_id is not None
+    weak = database.get_moment(weak_id)
+    weak_clip = Path(weak["clip_path"])
+
+    # 更强的新片段 -> 覆盖当天最弱片段 (文件与记录一起移除)
+    strong_id, database, _, _ = _save_clip(
+        tmp_path, monkeypatch, strong_meta, settings, database
+    )
+    assert strong_id is not None and strong_id != weak_id
+    assert database.get_moment(weak_id) is None
+    assert not weak_clip.exists()
+    assert database.count_moments_on_day("2025-06-15") == 1
+    weak_sel = float(weak["selection_score"])
+    assert database.get_moment(strong_id)["selection_score"] > weak_sel
+
+    # 更弱的新片段 -> 直接跳过
+    weaker_meta = dict(SAMPLE_META, session_id="3-3", score=0.4, face_score=0.1)
+    skip_id, database, _, _ = _save_clip(
+        tmp_path, monkeypatch, weaker_meta, settings, database
+    )
+    assert skip_id is None
+    assert database.get_moment(strong_id) is not None
+    assert database.count_moments_on_day("2025-06-15") == 1

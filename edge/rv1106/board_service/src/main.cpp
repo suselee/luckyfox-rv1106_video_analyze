@@ -300,6 +300,8 @@ int main(int argc, char* argv[]) {
     fusion_cfg.confirmed_ttl_seconds = cfg.get_double("pipeline.confirmed_ttl_seconds", 8.0);
     fusion_cfg.track_lost_seconds = cfg.get_double("pipeline.track_lost_seconds", 6.0);
     fusion_cfg.probable_hold_seconds = cfg.get_double("pipeline.probable_hold_seconds", 3.0);
+    fusion_cfg.confirm_child_hold_seconds = cfg.get_double(
+        "pipeline.confirm_child_hold_seconds", 60.0);
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 15.0);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;

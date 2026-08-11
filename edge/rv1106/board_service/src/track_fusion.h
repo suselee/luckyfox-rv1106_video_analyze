@@ -25,6 +25,7 @@ struct FusionConfig {
     double confirmed_ttl_seconds;
     double track_lost_seconds;
     double probable_hold_seconds;
+    double confirm_child_hold_seconds;
     double mqtt_update_seconds;
     float face_threshold;
     float face_high_threshold;

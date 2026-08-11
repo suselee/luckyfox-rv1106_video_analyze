@@ -177,10 +177,17 @@ void TrackFusion::apply_face_score(uint32_t track_id, float similarity, double n
     if (it == tracks_.end()) return;
     Track& track = it->second;
     track.face_score = std::max(track.face_score, similarity);
-    if (similarity >= config_.face_high_threshold) {
+    // 产品规则: 只有女儿(儿童轨迹)才能被低阈值命中累积确认; 成年人轨迹
+    // 只有强相似度 (>= face_high_threshold) 才能确认, 防止大人画面被保存。
+    bool strong = similarity >= config_.face_high_threshold;
+    bool child_anchor = strong ||
+        track.child_like ||
+        (track.last_child_like > 0 &&
+         now - track.last_child_like <= config_.confirm_child_hold_seconds);
+    if (strong) {
         track.face_hits = 2;
         track.first_face_hit = now;
-    } else if (similarity >= config_.face_threshold) {
+    } else if (similarity >= config_.face_threshold && child_anchor) {
         if (track.face_hits == 0 ||
             now - track.first_face_hit > config_.face_hit_window_seconds) {
             track.face_hits = 1;
@@ -189,7 +196,7 @@ void TrackFusion::apply_face_score(uint32_t track_id, float similarity, double n
             track.face_hits++;
         }
     }
-    if (track.face_hits >= 2) {
+    if (track.face_hits >= 2 && child_anchor) {
         if (track.identity != IDENTITY_CONFIRMED) confirmed_sessions_++;
         track.last_confirmed = now;
         track.identity = IDENTITY_CONFIRMED;
@@ -238,10 +245,16 @@ const char* TrackFusion::identity_name(IdentityLevel identity) {
 FusionEvent TrackFusion::make_event(const Track& track, const char* event, double now) const {
     FusionEvent out;
     out.event = event;
-    IdentityLevel reported =
-        event[0] == 'e' && track.identity == IDENTITY_UNKNOWN
-            ? track.published_identity
-            : track.identity;
+    IdentityLevel reported;
+    if (event[0] == 'e' && track.last_confirmed > 0) {
+        // end 事件携带会话达到过的最高身份, 避免 confirmed 身份在 ttl 内
+        // 衰减后导致确认过的片段不保存。
+        reported = IDENTITY_CONFIRMED;
+    } else if (event[0] == 'e' && track.identity == IDENTITY_UNKNOWN) {
+        reported = track.published_identity;
+    } else {
+        reported = track.identity;
+    }
     out.identity = identity_name(reported);
     out.session_id = track.session_id;
     out.track_id = track.id;

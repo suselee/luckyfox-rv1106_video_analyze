@@ -142,8 +142,14 @@ def build_checks(settings: Settings) -> list[Check]:
         ),
         Check(
             "4K RTSP stream",
-            bool(settings.rtsp_high_url),
-            _redact_url(settings.rtsp_high_url_for_ffmpeg) or "RTSP_HIGH_URL is empty",
+            bool(settings.rtsp_high_url) or settings.board_ingest_enabled,
+            _redact_url(settings.rtsp_high_url_for_ffmpeg)
+            or (
+                "offloaded to RV1106 board upload"
+                if settings.board_ingest_enabled
+                else "RTSP_HIGH_URL is empty"
+            ),
+            required=not settings.board_ingest_enabled,
         ),
         Check(
             "RTSP credentials",
