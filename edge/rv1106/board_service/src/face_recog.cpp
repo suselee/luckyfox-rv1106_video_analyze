@@ -164,4 +164,20 @@ bool FaceRecognizer::extract(const unsigned char* rgb, int img_w, int img_h,
     return true;
 }
 
+bool FaceRecognizer::extract_crop(const unsigned char* crop_rgb, int crop_w, int crop_h,
+                                  const FaceBox& box, std::vector<float>& emb) {
+    if (!inited_) return false;
+
+    std::vector<unsigned char> in((size_t)in_w_ * in_h_ * 3);
+    if (!crop_resize(crop_rgb, crop_w, crop_h, box, in_w_, in_h_, in.data())) return false;
+
+    rknn_model_set_input(&m_, in.data(), in_w_, in_h_, 3);
+    if (rknn_run(m_.ctx, NULL) < 0) return false;
+
+    float* feat = rknn_model_get_output_float(&m_, 0);
+    emb.assign(feat, feat + feat_dim_);
+    free(feat);
+    return true;
+}
+
 } // namespace dw

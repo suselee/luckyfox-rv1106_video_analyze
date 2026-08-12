@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <map>
 
 #include "config.h"
 #include "facedb.h"
@@ -52,7 +53,17 @@ struct FaceRoi {
     uint32_t track_id;
     float x1, y1, x2, y2;
     bool rockiva_anchored;
-    bool full_frame;
+};
+
+// Largest/clearest face sample seen per track. 识别时始终用轨迹内最大最清晰的
+// 人脸裁块: 人走近时脸变大, 缓存随之更新, 避免小脸/运动模糊拉低相似度。
+struct BestFace {
+    std::vector<uint8_t> crop;   // RGB 裁块 (frame 分辨率, box+margin 区域)
+    int crop_w = 0, crop_h = 0;  // 裁块尺寸 (像素)
+    float face_x1, face_y1, face_x2, face_y2;  // 人脸框, 相对裁块归一化
+    int face_w = 0, face_h = 0;  // 人脸尺寸 (frame 像素)
+    float score = 0.0f;          // retinaface 检测分数
+    double ts = 0.0;             // 存储时刻
 };
 
 // Crop the region out of the full RGB frame, run RetinaFace on the crop
@@ -307,11 +318,11 @@ int main(int argc, char* argv[]) {
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
+    std::map<uint32_t, BestFace> best_faces;
     int max_face_rois = cfg.get_int("pipeline.max_face_rois_per_scan", 2);
+    bool debug_dump_crops = cfg.get_bool("pipeline.debug_dump_crops", false);
     float face_roi_margin = (float)cfg.get_double("pipeline.face_roi_margin", 0.50);
     float head_roi_ratio = (float)cfg.get_double("pipeline.head_roi_ratio", 0.55);
-    double full_frame_fps = cfg.get_double("pipeline.full_frame_scan_fps", 1.0);
-    double full_frame_interval = full_frame_fps > 0 ? 1.0 / full_frame_fps : 1e9;
 
     MqttPublisher mqtt;
     if (!mqtt.connect(mqtt_host, mqtt_port, mqtt_cid, mqtt_user, mqtt_pass))
@@ -388,7 +399,7 @@ int main(int argc, char* argv[]) {
     double last_face_hit = -1e9;
     double last_health = -1e9;
     double last_dbg = -1e9;
-    double last_full_frame_scan = -1e9;
+    double last_crop_dump = -1e9;
     int reconnect_wait = 2;
 
     printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
@@ -588,7 +599,6 @@ int main(int argc, char* argv[]) {
                     job.x1 = iva_face.x1; job.y1 = iva_face.y1;
                     job.x2 = iva_face.x2; job.y2 = iva_face.y2;
                     job.rockiva_anchored = true;
-                    job.full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(track);
                 }
@@ -605,42 +615,19 @@ int main(int argc, char* argv[]) {
                     job.x2 = snap.box.x2;
                     job.y2 = snap.box.y1 + (snap.box.y2 - snap.box.y1) * head_roi_ratio;
                     job.rockiva_anchored = false;
-                    job.full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(snap.id);
                 }
 
-                double full_frame_due = now - last_full_frame_scan >= full_frame_interval;
-                if (!jobs.empty() || full_frame_due) {
+                if (!jobs.empty()) {
                     face_scan_attempts++;
-                    if (frame.to_rgb(rgb)) {
-                        // 全帧 retinaface 扫描: 不依赖 child_like 判定与头部 ROI,
-                        // 覆盖"人很近、脸最大"的时刻; 命中轨迹后与 ROI 任务同路径处理。
-                        if (full_frame_due) {
-                            last_full_frame_scan = now;
-                            std::vector<FaceBox> all_faces = face_detector.detect(
-                                rgb.data(), frame.width(), frame.height(), det_score);
-                            for (size_t i = 0; i < all_faces.size(); ++i) {
-                                const FaceBox& f = all_faces[i];
-                                if ((f.x2 - f.x1) * frame.width() < min_face ||
-                                    (f.y2 - f.y1) * frame.height() < min_face)
-                                    continue;
-                                float cx = (f.x1 + f.x2) * 0.5f;
-                                float cy = (f.y1 + f.y2) * 0.5f;
-                                uint32_t track = fusion.track_for_face(cx, cy);
-                                if (!track || !fusion.should_check_face(track, now)) continue;
-                                if (std::find(roi_tracks.begin(), roi_tracks.end(), track) != roi_tracks.end())
-                                    continue;
-                                FaceRoi job;
-                                job.track_id = track;
-                                job.x1 = f.x1; job.y1 = f.y1;
-                                job.x2 = f.x2; job.y2 = f.y2;
-                                job.rockiva_anchored = false;
-                                job.full_frame = true;
-                                jobs.push_back(job);
-                                roi_tracks.push_back(track);
-                            }
+                    if (best_faces.size() > 32) {
+                        for (auto it = best_faces.begin(); it != best_faces.end();) {
+                            if (now - it->second.ts > 90.0) it = best_faces.erase(it);
+                            else ++it;
                         }
+                    }
+                    if (frame.to_rgb(rgb)) {
                         int budget = max_face_rois;
                         for (size_t i = 0; i < jobs.size() && budget > 0; ++i, --budget) {
                             const FaceRoi& job = jobs[i];
@@ -658,11 +645,76 @@ int main(int argc, char* argv[]) {
                             if (face_w < min_face || face_h < min_face) continue;
                             eligible_face_detections++;
                             face_track_matches++;
-                            const char* roi_label = job.rockiva_anchored ? "iva"
-                                : (job.full_frame ? "full" : "head");
-                            if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), face, embedding)) {
+                            const char* roi_label = job.rockiva_anchored ? "iva" : "head";
+
+                            // 与 detect_faces_in_region 一致的裁块区域 (box+margin),
+                            // 更新该轨迹最大/最清晰人脸缓存。
+                            float roi_w = job.x2 - job.x1, roi_h = job.y2 - job.y1;
+                            float rx1 = std::max(0.0f, job.x1 - roi_w * face_roi_margin);
+                            float ry1 = std::max(0.0f, job.y1 - roi_h * face_roi_margin);
+                            float rx2 = std::min(1.0f, job.x2 + roi_w * face_roi_margin);
+                            float ry2 = std::min(1.0f, job.y2 + roi_h * face_roi_margin);
+                            int px1 = (int)(rx1 * frame.width());
+                            int py1 = (int)(ry1 * frame.height());
+                            int px2 = std::min(frame.width(), (int)(rx2 * frame.width() + 0.9999f));
+                            int py2 = std::min(frame.height(), (int)(ry2 * frame.height() + 0.9999f));
+                            int cw = px2 - px1, ch = py2 - py1;
+
+                            // 调试: 把 ROI 检测器输入裁块落盘 (PPM, RGB), 用于离线
+                            // 对照检测器行为; 每 5 秒最多一张, 仅 iva 任务。
+                            if (debug_dump_crops && job.rockiva_anchored &&
+                                now - last_crop_dump >= 5.0) {
+                                last_crop_dump = now;
+                                char path[96];
+                                snprintf(path, sizeof(path), "/tmp/roi_%.0f_%u.ppm",
+                                         now, job.track_id);
+                                FILE* pf = fopen(path, "wb");
+                                if (pf) {
+                                    fprintf(pf, "P6\n%d %d\n255\n", cw, ch);
+                                    for (int yy = 0; yy < ch; ++yy)
+                                        fwrite(rgb.data() + ((size_t)(py1 + yy) * frame.width() + px1) * 3,
+                                               1, (size_t)cw * 3, pf);
+                                    fclose(pf);
+                                    printf("[DETDBG] saved %s crop=%dx%d track=%u raw_faces=%zu\n",
+                                           path, cw, ch, job.track_id, faces.size());
+                                }
+                            }
+                            BestFace& bf = best_faces[job.track_id];
+                            if (cw >= 16 && ch >= 16) {
+                                bool replace = bf.crop_w <= 0;
+                                if (!replace) {
+                                    long long cur_area = (long long)face_w * face_h;
+                                    long long old_area = (long long)bf.face_w * bf.face_h;
+                                    if (cur_area > old_area) replace = true;
+                                    else if (face.score > bf.score + 0.05f &&
+                                             cur_area >= old_area * 85 / 100) replace = true;
+                                }
+                                if (replace) {
+                                    bf.crop.resize((size_t)cw * ch * 3);
+                                    for (int yy = 0; yy < ch; ++yy)
+                                        memcpy(bf.crop.data() + (size_t)yy * cw * 3,
+                                               rgb.data() + ((size_t)(py1 + yy) * frame.width() + px1) * 3,
+                                               (size_t)cw * 3);
+                                    bf.crop_w = cw; bf.crop_h = ch;
+                                    bf.face_x1 = (face.x1 * frame.width() - px1) / (float)cw;
+                                    bf.face_y1 = (face.y1 * frame.height() - py1) / (float)ch;
+                                    bf.face_x2 = (face.x2 * frame.width() - px1) / (float)cw;
+                                    bf.face_y2 = (face.y2 * frame.height() - py1) / (float)ch;
+                                    bf.face_w = face_w; bf.face_h = face_h;
+                                    bf.score = face.score;
+                                    bf.ts = now;
+                                }
+                            }
+
+                            // 用该轨迹当前最优人脸裁块做识别
+                            if (bf.crop_w <= 0) continue;
+                            FaceBox cf;
+                            cf.x1 = bf.face_x1; cf.y1 = bf.face_y1;
+                            cf.x2 = bf.face_x2; cf.y2 = bf.face_y2;
+                            cf.score = bf.score;
+                            if (!recognizer.extract_crop(bf.crop.data(), bf.crop_w, bf.crop_h, cf, embedding)) {
                                 printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d result=embedding-failed\n",
-                                       now, job.track_id, roi_label, face.score, face_w, face_h);
+                                       now, job.track_id, roi_label, bf.score, bf.face_w, bf.face_h);
                                 continue;
                             }
                             embedding_successes++;
@@ -673,7 +725,7 @@ int main(int argc, char* argv[]) {
                             if (similarity >= high_threshold) high_threshold_hits++;
                             printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d similarity=%.4f result=%s\n",
                                    now, job.track_id, roi_label,
-                                   face.score, face_w, face_h, similarity,
+                                   bf.score, bf.face_w, bf.face_h, similarity,
                                    similarity >= high_threshold ? "high-hit" :
                                    (similarity >= threshold ? "hit" : "below-threshold"));
                             fusion.apply_face_score(job.track_id, similarity, now);
@@ -748,9 +800,14 @@ int main(int argc, char* argv[]) {
                           max_face_similarity, threshold_hits, high_threshold_hits,
                           decoded_frames, scanned_frames, reconnects, high_json);
                 if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
-                printf("[HEALTH] cpu=%.1f%% mem=%.1fMB temp=%.1fC p95=%.1fms guard=%d\n",
+                printf("[HEALTH] cpu=%.1f%% mem=%.1fMB temp=%.1fC p95=%.1fms guard=%d "
+                       "dec=%ld scan=%ld rkf=%llu fscan=%llu roi=%llu det=%llu elig=%llu emb=%llu sim=%llu maxsim=%.4f\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,
-                       stats.temperature_c, p95, level);
+                       stats.temperature_c, p95, level,
+                       decoded_frames, scanned_frames, rockiva_face_detections,
+                       face_scan_attempts, roi_scans, retinaface_detections,
+                       eligible_face_detections, embedding_successes, similarity_samples,
+                       max_face_similarity);
                 detector_latencies.clear();
             }
         }

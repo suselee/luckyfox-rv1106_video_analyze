@@ -19,6 +19,12 @@ public:
     bool extract(const unsigned char* rgb, int img_w, int img_h,
                  const FaceBox& box, std::vector<float>& emb);
 
+    // 从已裁剪好的 RGB 区域提取特征 (box 坐标相对 crop 归一化)。
+    // 用于"每轨迹最大脸"识别: 缓存轨迹内最大/最清晰的人脸裁块,
+    // 识别时始终用质量最好的样本, 避免小脸/运动模糊拉低相似度。
+    bool extract_crop(const unsigned char* crop_rgb, int crop_w, int crop_h,
+                      const FaceBox& box, std::vector<float>& emb);
+
 private:
     RknnModel m_{};
     bool      inited_   = false;
