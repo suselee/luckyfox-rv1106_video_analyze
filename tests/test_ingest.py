@@ -158,7 +158,7 @@ def test_save_ingested_clip_publishes_moment(tmp_path, monkeypatch):
     spool = IngestSpool(settings)
     job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)
 
-    async def fake_remux(settings_, input_path, output_path, *, es_format=None):
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
         output_path.write_bytes(input_path.read_bytes())
 
     monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
@@ -314,7 +314,7 @@ def _save_clip(tmp_path, monkeypatch, meta, settings=None, database=None):
     spool = IngestSpool(settings)
     job_dir = spool.spool(dict(meta), VIDEO_BYTES)
 
-    async def fake_remux(settings_, input_path, output_path, *, es_format=None):
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
         output_path.write_bytes(input_path.read_bytes())
 
     monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
@@ -364,3 +364,155 @@ def test_save_ingested_clip_daily_cap_replaces_weakest(tmp_path, monkeypatch):
     assert skip_id is None
     assert database.get_moment(strong_id) is not None
     assert database.count_moments_on_day("2025-06-15") == 1
+
+AUDIO_BYTES = bytes(range(160))
+
+
+def build_multipart_with_audio(meta, audio=AUDIO_BYTES, audio_name="clip.g711a") -> bytes:
+    head_meta = (
+        f"--{BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="meta"\r\n'
+        "Content-Type: application/json\r\n\r\n"
+    )
+    meta_body = json.dumps(meta).encode("utf-8")
+    head_video = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="video"; filename="clip.h264"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    )
+    head_audio = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="audio"; filename="{audio_name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    )
+    tail = f"\r\n--{BOUNDARY}--\r\n".encode("utf-8")
+    return (
+        head_meta.encode("utf-8")
+        + meta_body
+        + b"\r\n"
+        + head_video.encode("utf-8")
+        + VIDEO_BYTES
+        + b"\r\n"
+        + head_audio.encode("utf-8")
+        + audio
+        + tail
+    )
+
+
+def test_parse_multipart_with_audio():
+    body = build_multipart_with_audio(SAMPLE_META)
+    parts = parse_multipart(body, BOUNDARY)
+    assert [part.name for part in parts] == ["meta", "video", "audio"]
+    assert parts[2].filename == "clip.g711a"
+    assert parts[2].data == AUDIO_BYTES
+
+
+def test_spool_writes_audio_file(tmp_path):
+    settings = replace(load_settings("/nonexistent.env"), board_ingest_dir=tmp_path / "spool")
+    spool = IngestSpool(settings)
+    meta = dict(SAMPLE_META, audio_codec="PCMA", audio_rate=8000, audio_channels=1)
+    job_dir = spool.spool(dict(meta), VIDEO_BYTES, audio=AUDIO_BYTES, audio_name="clip.g711a")
+    audio_path = spool.job_audio_path(job_dir, dict(meta))
+    assert audio_path is not None
+    assert audio_path.read_bytes() == AUDIO_BYTES
+
+    no_audio = spool.job_audio_path(job_dir, dict(SAMPLE_META))
+    assert no_audio is None
+
+
+def test_ingest_endpoint_accepts_audio_part(tmp_path):
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.migrate()
+    meta = dict(SAMPLE_META, audio_codec="PCMA", audio_rate=8000, audio_channels=1)
+    body = build_multipart_with_audio(meta)
+
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": str(len(body)),
+    }
+    handler.rfile = BytesIO(body)
+    handler._handle_board_ingest()
+    assert stored["payload"]["accepted"] is True
+
+    spool = IngestSpool(settings)
+    jobs = spool.pending_jobs()
+    assert len(jobs) == 1
+    audio_path = spool.job_audio_path(jobs[0], dict(meta))
+    assert audio_path is not None and audio_path.name == "clip.g711a"
+    assert audio_path.read_bytes() == AUDIO_BYTES
+
+
+def test_ingest_endpoint_rejects_unknown_audio_filename(tmp_path):
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.migrate()
+    body = build_multipart_with_audio(SAMPLE_META, audio_name="clip.exe")
+
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": str(len(body)),
+    }
+    handler.rfile = BytesIO(body)
+    handler._handle_board_ingest()
+    assert stored["payload"]["accepted"] is True
+    spool = IngestSpool(settings)
+    jobs = spool.pending_jobs()
+    assert len(jobs) == 1
+    assert spool.job_audio_path(jobs[0], dict(SAMPLE_META)) is None
+
+
+def test_save_ingested_clip_passes_audio_to_remux(tmp_path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    meta = dict(SAMPLE_META, audio_codec="PCMA", audio_rate=8000, audio_channels=1)
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(meta), VIDEO_BYTES, audio=AUDIO_BYTES, audio_name="clip.g711a")
+
+    calls = {}
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        calls.update(kwargs)
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+    moment_id = asyncio.run(save_ingested_clip(settings, database, spool, job_dir))
+    assert moment_id is not None
+    assert calls["audio_path"].name == "clip.g711a"
+    assert calls["audio_format"] == "alaw"
+    assert calls["audio_rate"] == 8000
+    assert calls["audio_channels"] == 1
+
+
+def test_save_ingested_clip_audio_failure_falls_back_to_video_only(tmp_path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    meta = dict(SAMPLE_META, audio_codec="PCMA", audio_rate=8000, audio_channels=1)
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(meta), VIDEO_BYTES, audio=AUDIO_BYTES, audio_name="clip.g711a")
+
+    attempts = []
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        attempts.append(kwargs.get("audio_path"))
+        if kwargs.get("audio_path") is not None:
+            raise RuntimeError("bad audio")
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+    moment_id = asyncio.run(save_ingested_clip(settings, database, spool, job_dir))
+    assert moment_id is not None
+    assert len(attempts) == 2  # 第一次带音频失败, 第二次纯视频成功
+    assert attempts[1] is None
+    clip = database.get_moment(moment_id)
+    assert Path(clip["clip_path"]).read_bytes() == VIDEO_BYTES

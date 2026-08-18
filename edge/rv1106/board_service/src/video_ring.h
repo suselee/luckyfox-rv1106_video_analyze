@@ -47,9 +47,11 @@ public:
     // 组装 [t0 - before, t1 + after] 的完整码流片段 (Annex-B 4 字节起始码):
     // 起点回退到窗口前最近关键帧 (并带上其参数集), 终点延伸到下一个关键帧。
     // gap_limit: 窗口内相邻 NAL 间隔超过该值视为断流, 返回 GAP。
+    // eff_start/eff_end (可选): 输出实际切片首/末 NAL 的时间戳 (供音频对齐)。
     CutResult cut(double t0, double t1, double before, double after,
                   double gap_limit, size_t max_bytes,
-                  std::vector<uint8_t>& out) const;
+                  std::vector<uint8_t>& out,
+                  double* eff_start = nullptr, double* eff_end = nullptr) const;
 
     size_t capacity() const { return cap_; }
     size_t used_bytes() const { return used_; }

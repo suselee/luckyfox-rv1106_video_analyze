@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_ring.h"
 #include "track_fusion.h"  // FusionEvent
 #include "video_ring.h"
 
@@ -13,7 +14,12 @@ namespace dw {
 struct HighStreamConfig {
     bool enabled = false;
     std::string rtsp_url;        // 4K 主码流
+    std::string bind_ip;         // 可选: 绑定的源地址 (换身份避开摄像头配额)
+    std::string pipe_path;       // 可选: FIFO 路径 (ffmpeg 拉流输出, 摄像头无配额)
+    std::string audio_pipe_path; // 可选: 音频 FIFO 路径 (ADTS AAC)
     size_t ring_mb = 64;         // 环形缓冲大小
+    bool audio_enabled = true;   // 尝试协商音频轨 (无音频时静默降级)
+    size_t audio_ring_mb = 2;    // 音频环形缓冲大小 (G711 8kHz ≈ 8KB/s)
     std::string upload_url;      // http://nas-host:port/api/ingest
     double context_before = 5.0; // 事件前保留
     double context_after = 10.0; // 事件后保留
@@ -26,6 +32,7 @@ struct HighStreamConfig {
     bool upload_probable = false; // false: 只切 confirmed
     std::string camera_id;
     double min_clip_seconds = 3.0;
+    double min_interval_seconds = 300.0; // 两次切片上传之间最短间隔 (全局冷却)
 };
 
 struct UploadStats {
@@ -34,6 +41,7 @@ struct UploadStats {
     unsigned long long ring_miss = 0;     // 事件窗口已出缓冲
     unsigned long long cut_ok = 0;
     unsigned long long cut_reject = 0;    // GAP/NO_PARAMS 等
+    unsigned long long cut_skipped = 0;   // 冷却窗口内跳过 (重复抑制)
     unsigned long long queue_drops = 0;
     double last_upload_ts = 0.0;
 };
@@ -64,6 +72,8 @@ private:
         std::string meta_json;
         std::string session_id;
         std::string clip_name;  // clip.h264 / clip.hevc
+        std::vector<uint8_t> audio;
+        std::string audio_name; // clip.g711a / clip.g711u / clip.adts (空=无音频)
         int attempts = 0;
         double next_ts = 0.0;
     };
@@ -76,10 +86,16 @@ private:
     void make_clip(const FusionEvent& ev);
     std::string meta_json(const FusionEvent& ev, double clip_start,
                           double clip_end, size_t clip_bytes);
+    static std::string audio_clip_name(const std::string& audio_codec);
 
     HighStreamConfig cfg_;
     VideoRing ring_;
+    AudioRing audio_ring_;
     std::string codec_;  // "H264"/"H265" (feed 线程写, 单线程访问)
+    std::string audio_codec_; // "PCMU"/"PCMA"/"AAC" (feed 线程写)
+    int audio_rate_ = 8000;
+    int audio_channels_ = 1;
+    unsigned long long audio_chunks_ = 0;
     pthread_t feed_th_ = 0;
     pthread_t upload_th_ = 0;
     volatile bool running_ = false;
@@ -92,6 +108,7 @@ private:
     std::deque<PendingClip> up_queue_;
 
     UploadStats stats_;
+    double last_cut_ts_ = 0.0;   // 上次成功切片时间 (全局冷却, feed 线程独占)
 };
 
 } // namespace dw

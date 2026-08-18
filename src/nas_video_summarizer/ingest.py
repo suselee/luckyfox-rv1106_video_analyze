@@ -162,7 +162,12 @@ class IngestSpool:
         self.failed_dir.mkdir(parents=True, exist_ok=True)
 
     def spool(
-        self, meta: dict[str, Any], video: bytes, meta_filename: str = "meta.json"
+        self,
+        meta: dict[str, Any],
+        video: bytes,
+        meta_filename: str = "meta.json",
+        audio: bytes | None = None,
+        audio_name: str | None = None,
     ) -> Path:
         key = ingest_event_key(meta)
         job_dir = self.pending_dir / key
@@ -173,6 +178,8 @@ class IngestSpool:
         )
         video_name = _video_filename(meta)
         (job_dir / video_name).write_bytes(video)
+        if audio is not None and audio_name:
+            (job_dir / audio_name).write_bytes(audio)
         return job_dir
 
     @staticmethod
@@ -189,6 +196,15 @@ class IngestSpool:
         if not video_path.exists():
             raise ValueError(f"spool job lacks video file: {job_dir}")
         return video_path
+
+    @staticmethod
+    def job_audio_path(job_dir: Path, meta: dict[str, Any]) -> Path | None:
+        """板端音频裸流 (可选)。无音频时返回 None。"""
+        audio_name = _audio_filename(meta)
+        if not audio_name:
+            return None
+        audio_path = job_dir / audio_name
+        return audio_path if audio_path.exists() else None
 
     def pending_jobs(self) -> list[Path]:
         return sorted(
@@ -219,6 +235,30 @@ class IngestSpool:
 def _video_filename(meta: dict[str, Any]) -> str:
     codec = str(meta.get("codec") or "H264").upper()
     return "clip.hevc" if codec.startswith("H265") else "clip.h264"
+
+
+def _audio_filename(meta: dict[str, Any]) -> str | None:
+    """按板端 meta 的 audio_codec 推导音频裸流文件名。"""
+    codec = str(meta.get("audio_codec") or "").upper()
+    if codec == "PCMA":
+        return "clip.g711a"
+    if codec == "PCMU":
+        return "clip.g711u"
+    if codec == "AAC":
+        return "clip.adts"
+    return None
+
+
+def _audio_demux(meta: dict[str, Any]) -> tuple[str, int, int] | None:
+    """音频裸流对应的 ffmpeg demuxer + 采样率 + 声道。"""
+    codec = str(meta.get("audio_codec") or "").upper()
+    if codec == "PCMA":
+        return "alaw", int(meta.get("audio_rate") or 8000), int(meta.get("audio_channels") or 1)
+    if codec == "PCMU":
+        return "mulaw", int(meta.get("audio_rate") or 8000), int(meta.get("audio_channels") or 1)
+    if codec == "AAC":
+        return "aac", 0, 0   # ffmpeg 的 ADTS demuxer 名为 "aac"
+    return None
 
 
 def _slugify(value: str) -> str:
@@ -317,12 +357,33 @@ async def save_ingested_clip(
         prefix=".nas-video-staged-", dir=day_dir
     ) as staging_dir:
         staged_clip_path = Path(staging_dir) / clip_path.name
-        await remux_elementary_stream(
-            settings,
-            video_path,
-            staged_clip_path,
-            es_format=_es_format(meta.get("codec")),
-        )
+        audio_path = spool.job_audio_path(job_dir, meta)
+        audio_demux = _audio_demux(meta) if audio_path is not None else None
+        try:
+            await remux_elementary_stream(
+                settings,
+                video_path,
+                staged_clip_path,
+                es_format=_es_format(meta.get("codec")),
+                audio_path=audio_path,
+                audio_format=audio_demux[0] if audio_demux else None,
+                audio_rate=audio_demux[1] if audio_demux else None,
+                audio_channels=audio_demux[2] if audio_demux else None,
+            )
+        except RuntimeError:
+            # 音频裸流损坏/编码误判时降级为纯视频重封装, 不阻塞片段保存。
+            if audio_path is None:
+                raise
+            print(
+                f"[INGEST] remux with audio failed for {key}; retrying video-only",
+                flush=True,
+            )
+            await remux_elementary_stream(
+                settings,
+                video_path,
+                staged_clip_path,
+                es_format=_es_format(meta.get("codec")),
+            )
         os.replace(staged_clip_path, clip_path)
 
     # 新片段已安全落盘; 现在移除被替换的当天最弱片段 (文件 + DB 记录)。

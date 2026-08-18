@@ -40,13 +40,20 @@ int main(int argc, char* argv[]) {
     }
 
     H264Source src;
-    if (!src.open(url)) {
+    if (!src.open(url, true)) {
         printf("[ERR] RTSP open failed\n");
         return 1;
     }
     const std::string& codec = src.codec();
     printf("[PROBE] codec=%s duration=%.0fs window=%.0fs\n",
            codec.c_str(), duration, window_secs);
+    if (src.has_audio()) {
+        printf("[PROBE] audio=%s rate=%d channels=%d (fmtp=%s)\n",
+               src.audio().codec.c_str(), src.audio().rate,
+               src.audio().channels, src.audio().fmtp.c_str());
+    } else {
+        printf("[PROBE] audio=none\n");
+    }
 
     NalStats stats;
     stats.codec = &codec;
@@ -58,6 +65,8 @@ int main(int argc, char* argv[]) {
     });
 
     std::vector<uint8_t> chunk(512 * 1024);
+    std::vector<uint8_t> audio_chunk(64 * 1024);
+    unsigned long long audio_bytes = 0;
     double begin = now_seconds();
     stats.window_start = begin;
     int reconnect_wait = 2;
@@ -81,6 +90,12 @@ int main(int argc, char* argv[]) {
             stats.window_bytes += (unsigned long long)n;
             scanner.feed(chunk.data(), (size_t)n, now);
         }
+        // 音频排空 (防止源内缓冲无限增长), 统计码率。
+        while (true) {
+            int an = src.read_audio(audio_chunk.data(), (int)audio_chunk.size());
+            if (an <= 0) break;
+            audio_bytes += (unsigned long long)an;
+        }
         if (now - stats.window_start >= window_secs) {
             double el = now - stats.window_start;
             double kbps = stats.window_bytes * 8.0 / el / 1e3;
@@ -98,6 +113,9 @@ int main(int argc, char* argv[]) {
     double end = now_seconds();
     scanner.flush(end);
     stats.print_summary(end - begin);
+    if (audio_bytes > 0)
+        printf("[PROBE] audio stream: %llu bytes ≈ %.1f kbps\n",
+               audio_bytes, audio_bytes * 8.0 / (end - begin) / 1e3);
     if (stats.nals == 0) {
         printf("[PROBE] no NAL data received; stream may be unauthenticated or wrong channel\n");
         return 2;

@@ -219,7 +219,20 @@ void TrackFusion::update_identity(Track& track, double now) {
                 now - track.last_child_like <= config_.probable_hold_seconds) &&
                track.observations >= config_.probable_min_observations &&
                now - track.first_seen >= config_.probable_min_seconds) {
-        track.identity = IDENTITY_PROBABLE;
+        // 双通道升 probable:
+        //  - 人脸通道: 曾以 >= threshold 相似度命中女儿库 (露脸证据,
+        //    防几何启发式被成人触发);
+        //  - 无脸儿童通道: 活动量持续足够高的 child_like 轨迹也升
+        //    probable (女儿玩耍/跑动时不常露清晰正脸; 坐着的成人体型
+        //    近似儿童但活动量低, 用 probable_min_activity 区分)。
+        bool face_evidence = track.face_score >= config_.face_threshold;
+        bool active_child = track.child_like &&
+            track.activity_score >= config_.probable_min_activity;
+        if (face_evidence || active_child) {
+            track.identity = IDENTITY_PROBABLE;
+        } else {
+            track.identity = IDENTITY_UNKNOWN;
+        }
     } else {
         track.identity = IDENTITY_UNKNOWN;
     }

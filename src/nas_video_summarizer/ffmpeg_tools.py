@@ -548,11 +548,20 @@ async def remux_elementary_stream(
     output_path: Path,
     *,
     es_format: str | None = None,
+    audio_path: Path | None = None,
+    audio_format: str | None = None,
+    audio_rate: int | None = None,
+    audio_channels: int | None = None,
 ) -> None:
     """把裸基本流 (H.264/H.265 Annex-B) 以 -c copy 重封装为 MP4。
 
     es_format 为 ffmpeg 输入格式名 ("h264"/"hevc"); 为 None 时由 ffmpeg
     按文件扩展名自行探测。仅用于板端上传的板载环形缓冲片段。
+
+    可选音频: audio_path 为板端上传的音频裸流, audio_format 为 ffmpeg
+    输入 demuxer ("alaw"/"mulaw"/"aac"); G711 需要 audio_rate/
+    audio_channels 显式给出 (默认 8000/1)。音频默认 -c:a copy
+    (CLIP_AUDIO_CODEC=aac 时重编码, 便于浏览器播放)。
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -567,8 +576,23 @@ async def remux_elementary_stream(
     command += [
         "-i",
         str(input_path),
-        "-c",
-        "copy",
+    ]
+    if audio_path is not None and audio_format:
+        command += ["-f", audio_format]
+        if audio_format in ("alaw", "mulaw"):
+            command += ["-ar", str(audio_rate or 8000), "-ac", str(audio_channels or 1)]
+        command += ["-i", str(audio_path)]
+
+    reencoding_audio = audio_path is not None and settings.clip_audio_codec != "copy"
+    if audio_path is not None:
+        command += ["-map", "0:v:0", "-map", "1:a:0"]
+    command += ["-c:v", "copy"]
+    if audio_path is not None:
+        if reencoding_audio:
+            command += ["-c:a", settings.clip_audio_codec, "-b:a", "192k"]
+        else:
+            command += ["-c:a", "copy"]
+    command += [
         "-movflags",
         "+faststart",
         str(output_path),

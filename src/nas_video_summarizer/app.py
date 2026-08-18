@@ -126,6 +126,10 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+# 板端上传允许的音频裸流文件名 (与 edge 端 audio_clip_name 保持一致)。
+_AUDIO_FILENAMES = ("clip.g711a", "clip.g711u", "clip.adts")
+
+
 def _moment_id_from_path(path: str, suffix: str = "") -> int | None:
     prefix = "/api/moments/"
     if not path.startswith(prefix):
@@ -267,6 +271,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, "multipart must contain meta and video parts"
             )
             return
+        audio_part = next(
+            (
+                part
+                for part in parts
+                if part.name == "audio"
+                and part.filename in _AUDIO_FILENAMES
+            ),
+            None,
+        )
 
         try:
             meta, meta_error = validate_meta(json.loads(meta_part.data.decode("utf-8")))
@@ -286,7 +299,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        spool.spool(meta, video_part.data)
+        spool.spool(
+            meta,
+            video_part.data,
+            audio=audio_part.data if audio_part else None,
+            audio_name=audio_part.filename if audio_part else None,
+        )
         self._send_json(
             {"accepted": True, "duplicate": False, "event_key": event_key},
             status=HTTPStatus.ACCEPTED,

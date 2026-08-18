@@ -11,18 +11,22 @@ Nextcloud 布局。本页描述 NAS 侧 `/api/ingest` 端点与板端 `[high]`/`
 ```
 RV1106 板 (edge/rv1106/board_service)
   HighStream::feed_loop     RTSP 4K -> NALScanner -> VideoRing (内存, 不落盘)
+                            RTSP 音频轨 -> AudioRing (内存, 可选)
   main.cpp                  FusionEvent confirmed/probable -> enqueue_event
   HighStream::make_clip     ring.cut() 关键帧对齐切片 + meta_json
+                            audio_ring.cut() 同窗口音频切片
   HighStream::upload_loop   有界重试队列 -> POST http://NAS:8000/api/ingest
-                              multipart: meta=JSON, video=clip.h264|clip.hevc
+                              multipart: meta=JSON, video=clip.h264|clip.hevc,
+                              audio=clip.g711a|clip.g711u|clip.adts (可选)
 
 NAS (src/nas_video_summarizer)
   app.RequestHandler._handle_board_ingest
     解析 multipart -> validate_meta -> event_key 幂等去重
-    落盘排队 board_ingest_dir/pending/<key>/{meta.json, clip.h264}
+    落盘排队 board_ingest_dir/pending/<key>/{meta.json, clip.h264[, clip.g711a]}
     返回 202 {"accepted": true}
   workers._board_ingest_loop (每 5s)
-    save_ingested_clip: ffmpeg -c copy -movflags +faststart .h264 -> .mp4
+    save_ingested_clip: ffmpeg 视频 ES + 音频裸流 (alaw/mulaw/aac)
+    -c copy -movflags +faststart -> 带音轨 MP4
     -> NEXTCLOUD_OUTPUT_DIR/YYYY-MM-DD/HHMMSS_slug.mp4 + .json
     -> create_moment(analysis_backend=rv1106_edge, source_stream_role=board)
     -> rebuild_day_archive + ingested_clips 幂等落库
@@ -47,6 +51,8 @@ NAS (src/nas_video_summarizer)
 [high]
 url = rtsp://camera/4k-stream
 ring_mb = 64
+audio_enabled = true             ; 协商音频轨 (无音频时自动降级纯视频)
+audio_ring_mb = 2                ; 音频环形缓冲 MB (G711 8kHz ≈ 8KB/s)
 upload_probable = false          ; true: probable 事件也切
 [upload]
 url = http://<nas>:8000/api/ingest
@@ -60,6 +66,24 @@ retry_delay_seconds = 5
 upload_timeout_seconds = 30
 max_queue = 8
 ```
+
+## 音频支持
+
+板端 RTSP 客户端额外 SETUP 音频轨 (interleaved=2-3), 把 PCMU/PCMA 透传为
+原始 PCM, 把 MPEG4-GENERIC (AAC) 包成 ADTS 帧, 与视频一起进内存环形缓冲。
+切片时音频按视频实际切片边界 (关键帧对齐后的 eff_start/eff_end) 同窗口
+截取, 作为 multipart 第二个文件字段 `audio` 上传 (文件名按编码:
+`clip.g711a` / `clip.g711u` / `clip.adts`)。NAS 端 `remux_elementary_stream`
+用 ffmpeg `-f alaw|-f mulaw|-f aac` 解封装音频, `-c:a copy` 合成带音轨的
+MP4 (`CLIP_AUDIO_CODEC=aac` 时重编码为 AAC 便于浏览器播放)。
+
+- 摄像头无音频/编码不支持 (G726/G722 等) 时板端静默降级为纯视频上传,
+  不影响切片保存; 板端 health JSON `high_ring.audio` 字段显示协商结果。
+- 音频环形缓冲覆盖不足 (音频断流/缓冲溢出) 时该次切片放弃音频,
+  视频照常上传。
+- 板端 meta 增加 `audio_codec`/`audio_rate`/`audio_channels` 字段;
+  NAS 按 `audio_codec` 推导裸流文件名与 demuxer, 文件名白名单
+  `clip.g711a|clip.g711u|clip.adts` 之外一律忽略。
 
 ## 事件键 / 幂等
 
@@ -82,7 +106,8 @@ max_queue = 8
   "box": [..], "best_box": [..], "people_count": 1,
   "camera_id": "home-camera",
   "clip_start": ..., "clip_end": ..., "clip_bytes": ...,
-  "codec": "H264", "source": "board_high_ring"
+  "codec": "H264", "audio_codec": "PCMA", "audio_rate": 8000,
+  "audio_channels": 1, "source": "board_high_ring"
 }
 ```
 

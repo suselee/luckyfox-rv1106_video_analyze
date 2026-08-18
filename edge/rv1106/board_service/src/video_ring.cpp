@@ -83,8 +83,11 @@ size_t VideoRing::snap_start(const std::deque<RingMeta>& m, size_t lo,
 
 CutResult VideoRing::cut(double t0, double t1, double before, double after,
                          double gap_limit, size_t max_bytes,
-                         std::vector<uint8_t>& out) const {
+                         std::vector<uint8_t>& out,
+                         double* eff_start, double* eff_end) const {
     out.clear();
+    if (eff_start) *eff_start = 0.0;
+    if (eff_end) *eff_end = 0.0;
     if (metas_.empty()) return CutResult::EMPTY_WINDOW;
 
     double lo_ts = t0 - before;
@@ -133,6 +136,8 @@ CutResult VideoRing::cut(double t0, double t1, double before, double after,
         out.insert(out.end(), sc, sc + 4);
         read_at(m.off, m.size, out);
     }
+    if (eff_start) *eff_start = metas_[start_ps].ts;
+    if (eff_end) *eff_end = metas_[end].ts;
     return CutResult::OK;
 }
 

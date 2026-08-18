@@ -289,7 +289,10 @@ bool MppDecoder::send(const uint8_t* data, int len, uint64_t pts, bool end_of_fr
     st.bEndOfFrame  = end_of_frame ? RK_TRUE : RK_FALSE;
     st.bBypassMbBlk = RK_FALSE;   // 让 VDEC 内部拷贝, 送完即可释放
 
-    RK_S32 ret = RK_MPI_VDEC_SendStream(chn_, &st, -1);
+    // 非阻塞投递: 阻塞 (-1) 会拖慢主循环读包速率 (曾实测主循环 0.4s/轮,
+    // 摄像头 35 包/s 推流时 socket 缓冲涨满, 摄像头静默踢断会话)。
+    // 失败时丢该块 (中间帧), 关键帧稍后会再到达。
+    RK_S32 ret = RK_MPI_VDEC_SendStream(chn_, &st, 0);
     RK_MPI_MB_ReleaseMB(blk);
     return ret == RK_SUCCESS;
 }

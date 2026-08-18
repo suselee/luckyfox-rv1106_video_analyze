@@ -34,11 +34,7 @@ static void on_signal(int) { g_running = 0; }
 
 static HighStream* g_high = NULL;  // 4K 高码流链路 (可选)
 
-static double now_seconds() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec / 1e6;
-}
+// 与 time_util.h 的 dw::now_seconds() 同源同义 (gettimeofday)。
 
 static int h264_nal_type(const uint8_t* data, int len) {
     int off = 0;
@@ -53,6 +49,7 @@ struct FaceRoi {
     uint32_t track_id;
     float x1, y1, x2, y2;
     bool rockiva_anchored;
+    bool from_full_frame;
 };
 
 // Largest/clearest face sample seen per track. 识别时始终用轨迹内最大最清晰的
@@ -225,6 +222,10 @@ static bool publish_legacy_face(MqttPublisher& mqtt, const std::string& topic, i
 }
 
 int main(int argc, char* argv[]) {
+    // 行缓冲: 日志立即落盘, 便于板端实时诊断 (默认全缓冲在低频输出时
+    // 可延迟数小时, 曾导致 HEALTH/FFDBG 长期不可见)。
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     if (argc < 2) {
         printf("Usage: %s <config.ini>\n", argv[0]);
         return 1;
@@ -240,6 +241,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string rtsp_url = cfg.get("rtsp.url");
+    bool rtsp_stdin_mode = cfg.get_bool("rtsp.stdin_mode", false);
     int rtsp_w = cfg.get_int("rtsp.width", 640);
     int rtsp_h = cfg.get_int("rtsp.height", 360);
     bool keyframes_only = cfg.get_bool("rtsp.keyframes_only", false);
@@ -294,6 +296,13 @@ int main(int argc, char* argv[]) {
     printf("[INIT] facedb=%d dim=%d threshold=%.3f high=%.3f\n",
            db.count(), db.dim(), threshold, high_threshold);
 
+    // 全帧检测用独立 FaceDetector 实例: 与 ROI 检测器互不干扰 (rknn 上下文独立)
+    FaceDetector ff_detector;
+    if (!ff_detector.init(det_path.c_str())) {
+        printf("[ERR] full-frame face detector init failed\n");
+        return 1;
+    }
+
     RockIvaDetector iva;
     bool fusion_enabled = pipeline_mode == "fusion" &&
         iva.init(rockiva_dir, rtsp_w, rtsp_h,
@@ -315,6 +324,8 @@ int main(int argc, char* argv[]) {
     fusion_cfg.confirm_child_hold_seconds = cfg.get_double(
         "pipeline.confirm_child_hold_seconds", 60.0);
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 15.0);
+    fusion_cfg.probable_min_activity = (float)cfg.get_double(
+        "pipeline.probable_min_activity", 0.20);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
@@ -332,7 +343,12 @@ int main(int argc, char* argv[]) {
     HighStream* high = NULL;
     HighStreamConfig high_cfg;
     high_cfg.rtsp_url = cfg.get("high.url");
+    high_cfg.bind_ip = cfg.get("high.bind_ip");
+    high_cfg.pipe_path = cfg.get("high.pipe_path");
+    high_cfg.audio_pipe_path = cfg.get("high.audio_pipe_path");
     high_cfg.ring_mb = (size_t)cfg.get_int("high.ring_mb", 64);
+    high_cfg.audio_enabled = cfg.get_bool("high.audio_enabled", true);
+    high_cfg.audio_ring_mb = (size_t)cfg.get_int("high.audio_ring_mb", 2);
     high_cfg.upload_url = cfg.get("upload.url");
     high_cfg.upload_probable = cfg.get_bool("high.upload_probable", false);
     high_cfg.context_before = cfg.get_double("upload.context_before_seconds", 5.0);
@@ -344,6 +360,7 @@ int main(int argc, char* argv[]) {
     high_cfg.retry_delay = cfg.get_double("upload.retry_delay_seconds", 5.0);
     high_cfg.upload_timeout = cfg.get_double("upload.upload_timeout_seconds", 30.0);
     high_cfg.max_queue = cfg.get_int("upload.max_queue", 8);
+    high_cfg.min_interval_seconds = cfg.get_double("upload.min_interval_seconds", 300.0);
     high_cfg.camera_id = camera_id;
     if (!high_cfg.rtsp_url.empty() && !high_cfg.upload_url.empty()) {
         high_cfg.enabled = true;
@@ -380,10 +397,19 @@ int main(int argc, char* argv[]) {
     uint32_t iva_frame_id = 0;
     long sequence = 0;
     long decoded_frames = 0;
+    long session_frames_baseline = 0;
+    long session_feeds = 0;
+    long session_idrs = 0;
+    double last_diag_log_ = -1e9;
     long scanned_frames = 0;
     long reconnects = 0;
+    int idle_chunk_reads = 0;        // 连续无数据次数 (3s poll 超时/次)
+    const int STALL_LIMIT = 20;      // 60s 无数据才强制重连 (期间每 3s 保活探测)
+                                     // 摄像头惩罚模式会发几秒停几秒, 等待 > 重连
     unsigned long long rockiva_face_detections = 0;
     unsigned long long face_scan_attempts = 0;
+    unsigned long long full_frame_scans = 0;
+    unsigned long long full_frame_detections = 0;
     unsigned long long roi_scans = 0;
     unsigned long long retinaface_detections = 0;
     unsigned long long eligible_face_detections = 0;
@@ -400,6 +426,8 @@ int main(int argc, char* argv[]) {
     double last_health = -1e9;
     double last_dbg = -1e9;
     double last_crop_dump = -1e9;
+    double last_full_frame = -1e9;
+    double last_feed_ts = -1e9;
     int reconnect_wait = 2;
 
     printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
@@ -430,6 +458,11 @@ int main(int argc, char* argv[]) {
                 reconnect_wait = 2;
                 last_health = -1e9;
                 printf("[SCHEDULE] active window ended; RTSP and decoder stopped\n");
+            } else if (g_high && g_high->running()) {
+                // 窗口外启动 (初始 stream_active=false) 也要停掉 4K 链路,
+                // 避免窗口外反复重连摄像头刷日志。
+                g_high->stop();
+                printf("[SCHEDULE] high-stream stopped (window closed)\n");
             }
             if (loop_now - last_health >= 60.0) {
                 last_health = loop_now;
@@ -465,7 +498,27 @@ int main(int argc, char* argv[]) {
         }
 
         if (!stream_active) {
-            if (!src.open(rtsp_url) || !decoder.init()) {
+            // 摄像头固件对"历史高频重连的客户端"有持久配额 (每会话只推
+            // SPS/PPS + 几 KB 数据), 与协议细节无关 (已对齐 ffprobe 全部
+            // 握手特征仍被配额)。stdin 模式: 由外部 ffprobe 拉流, 摄像头
+            // 对 ffprobe 无配额, 女儿_watch 从管道读 Annex-B。
+            if (rtsp_stdin_mode) {
+                if (!src.open_stdin() || !decoder.init()) {
+                    reconnects++;
+                    printf("[WARN] stdin/decoder init failed; retry in %ds\n",
+                           reconnect_wait);
+                    sleep(reconnect_wait);
+                    reconnect_wait = std::min(30, reconnect_wait * 2);
+                    continue;
+                }
+                stream_active = true;
+                reconnect_wait = 2;
+                session_frames_baseline = decoded_frames;
+                session_feeds = 0;
+                session_idrs = 0;
+                last_scan = -1e9;
+                printf("[SCHEDULE] stdin stream ready (ffprobe pipe)\n");
+            } else if (!src.open(rtsp_url, true) || !decoder.init()) {
                 reconnects++;
                 src.close();
                 decoder.deinit();
@@ -481,6 +534,9 @@ int main(int argc, char* argv[]) {
                 printf("[SCHEDULE] high-stream (re)started\n");
             }
             reconnect_wait = 2;
+            session_frames_baseline = decoded_frames;
+            session_feeds = 0;
+            session_idrs = 0;
             last_scan = -1e9;
             last_face_fallback = -1e9;
             last_health = -1e9;
@@ -488,21 +544,90 @@ int main(int argc, char* argv[]) {
         }
 
         int n = src.read_chunk(chunk.data(), (int)chunk.size());
+        if (n == -2) {
+            // EOF: 摄像头主动断开。
+            // 本会话拿到过帧 → 快速重连 (5s) 保持数据连续;
+            // 没拿到帧就被踢 → 低频重连 (30s), 避免高频新连接
+            // 触发摄像头侧惩罚 (曾实测连接周期被压到 2-3s)。
+            if (!g_running) break;
+            reconnects++;
+            if (now_seconds() - last_diag_log_ > 30.0) {
+                last_diag_log_ = now_seconds();
+            }
+            src.close();
+            decoder.deinit();
+            stream_active = false;
+            idle_chunk_reads = 0;
+            if (decoded_frames > session_frames_baseline) {
+                reconnect_wait = 2;
+                sleep(5);
+            } else {
+                if (now_seconds() - last_diag_log_ > 30.0) {
+                    last_diag_log_ = now_seconds();
+                    printf("[DIAG] EOF, session frames=%ld, backoff=%d\n",
+                           decoded_frames - session_frames_baseline, reconnect_wait);
+                }
+                // 低频重连: 摄像头对高频新连接进入惩罚模式
+                // (每个会话只给几秒数据就断)。30s 间隔让惩罚窗口过期。
+                sleep(30);
+            }
+            continue;
+        }
+        if (n == -3) {
+            // 音频包/RTCP: 数据在流动, 不计 stall, 不喂解码器
+            idle_chunk_reads = 0;
+            continue;
+        }
         if (n < 0) {
             if (!g_running) break;
             reconnects++;
             src.close();
             decoder.deinit();
             stream_active = false;
+            idle_chunk_reads = 0;
             sleep(reconnect_wait);
             reconnect_wait = std::min(30, reconnect_wait * 2);
             continue;
         }
+        if (n == 0) {
+            // RTP 无数据 (3s poll 超时)。摄像头对历史高频重连的客户端
+            // 有配额: 每会话推几 KB 后静默。注意: 不能在此发 GET_PARAMETER
+            // 保活 —— 它与 RTP 数据共用一个 TCP 连接, rtsp_req 逐字节读
+            // 响应时会吞掉 RTP 帧破坏读流 (曾实测数据流被持续破坏)。
+            // 保活改用单向 RTCP RR (maybe_send_rtcp, 不读响应)。
+            if (++idle_chunk_reads >= STALL_LIMIT) {
+                reconnects++;
+                if (now_seconds() - last_diag_log_ > 30.0) {
+                    last_diag_log_ = now_seconds();
+                    printf("[DIAG] STALL: %d x 3s poll timeout, no data; reconnect\n",
+                           idle_chunk_reads);
+                }
+                src.close();
+                decoder.deinit();
+                stream_active = false;
+                idle_chunk_reads = 0;
+                sleep(30);
+                continue;
+            }
+            continue;
+        }
+        idle_chunk_reads = 0;
         if (n > 0) {
             int nal_type = h264_nal_type(chunk.data(), n);
+            // keyframes_only: 关键帧必喂; 中间帧按 1s 节流抽样,
+            // 把有效分析帧率从 GOP(约 0.5fps)提到 ~1fps, 让 person
+            // 扫描/轨迹融合回到全帧时代的节奏, 同时 CPU 只有全帧的 ~1/10。
             bool feed = !keyframes_only || nal_type == 5 || nal_type == 6 ||
                         nal_type == 7 || nal_type == 8 || nal_type == 9;
-            if (feed) decoder.send(chunk.data(), n, pts++, true);
+            if (!feed && keyframes_only && now_seconds() - last_feed_ts >= 1.0) {
+                feed = true;
+                last_feed_ts = now_seconds();
+            }
+            if (feed) {
+                decoder.send(chunk.data(), n, pts++, true);
+                session_feeds++;
+                if (nal_type == 5) session_idrs++;
+            }
         }
 
         while (true) {
@@ -580,6 +705,52 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
+                // 全帧检测 (独立于 jobs, 1s 节流): 脸保持全帧自然尺寸
+                // (640x360 → letterbox 320, 脸约 20-40px), 检测可靠; ROCKIVA
+                // 小裁块路径会把脸放大 4-8x 导致检测丢失。直接识别并计入融合。
+                if (now - last_full_frame >= 1.0 && frame.to_rgb(rgb)) {
+                    last_full_frame = now;
+                    full_frame_scans++;
+                    std::vector<FaceBox> all_faces = ff_detector.detect(
+                        rgb.data(), frame.width(), frame.height(), det_score);
+                    full_frame_detections += all_faces.size();
+                    if (all_faces.empty())
+                        printf("[FFDBG] t=%.1f no-face-in-full-frame\n", now);
+                    for (size_t fi = 0; fi < all_faces.size(); ++fi) {
+                        const FaceBox& f = all_faces[fi];
+                        int fw_px = (int)((f.x2 - f.x1) * frame.width());
+                        int fh_px = (int)((f.y2 - f.y1) * frame.height());
+                        if (fw_px < min_face || fh_px < min_face) continue;
+                        float cx = (f.x1 + f.x2) * 0.5f;
+                        float cy = (f.y1 + f.y2) * 0.5f;
+                        uint32_t track = fusion.track_for_face(cx, cy);
+                        if (!track || !fusion.should_check_face(track, now)) continue;
+                        fusion.mark_face_checked(track, now);
+                        roi_scans++;
+                        eligible_face_detections++;
+                        face_track_matches++;
+                        std::vector<float> embedding;
+                        if (!recognizer.extract(rgb.data(), frame.width(),
+                                                frame.height(), f, embedding)) {
+                            printf("[FFDBG] t=%.1f face=%ux%u track=%u embed-fail\n",
+                                   now, fw_px, fh_px, track);
+                            continue;
+                        }
+                        embedding_successes++;
+                        float similarity = db.best_similarity(embedding);
+                        similarity_samples++;
+                        max_face_similarity = std::max(max_face_similarity, similarity);
+                        if (similarity >= threshold) threshold_hits++;
+                        if (similarity >= high_threshold) high_threshold_hits++;
+                        printf("[FACE] t=%.1f track=%u roi=full det=%.3f size=%dx%d "
+                               "similarity=%.4f result=%s\n",
+                               now, track, f.score, fw_px, fh_px, similarity,
+                               similarity >= high_threshold ? "high-hit" :
+                               (similarity >= threshold ? "hit" : "below-threshold"));
+                        fusion.apply_face_score(track, similarity, now);
+                    }
+                }
+
                 // Schedule recognition jobs: RockIVA face boxes anchored to
                 // tracks first (precise attribution, works even when the
                 // child is held), then head regions of due child-like tracks.
@@ -599,6 +770,7 @@ int main(int argc, char* argv[]) {
                     job.x1 = iva_face.x1; job.y1 = iva_face.y1;
                     job.x2 = iva_face.x2; job.y2 = iva_face.y2;
                     job.rockiva_anchored = true;
+                    job.from_full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(track);
                 }
@@ -615,6 +787,7 @@ int main(int argc, char* argv[]) {
                     job.x2 = snap.box.x2;
                     job.y2 = snap.box.y1 + (snap.box.y2 - snap.box.y1) * head_roi_ratio;
                     job.rockiva_anchored = false;
+                    job.from_full_frame = false;
                     jobs.push_back(job);
                     roi_tracks.push_back(snap.id);
                 }
@@ -637,6 +810,44 @@ int main(int argc, char* argv[]) {
                                 face_detector, rgb, frame.width(), frame.height(),
                                 job, face_roi_margin, roi_det_score);
                             retinaface_detections += faces.size();
+
+                            // 调试: 把 ROI 检测器输入裁块落盘 (PPM, RGB), 用于离线
+                            // 对照检测器行为; 每 5 秒最多一张, 仅 iva 任务。
+                            // 必须放在任何 selection/min_face 过滤之前: 检测空结果
+                            // 正是要抓的现象。
+                            if (debug_dump_crops && job.rockiva_anchored &&
+                                now - last_crop_dump >= 5.0) {
+                                last_crop_dump = now;
+                                float roi_w = job.x2 - job.x1, roi_h = job.y2 - job.y1;
+                                float rx1 = std::max(0.0f, job.x1 - roi_w * face_roi_margin);
+                                float ry1 = std::max(0.0f, job.y1 - roi_h * face_roi_margin);
+                                float rx2 = std::min(1.0f, job.x2 + roi_w * face_roi_margin);
+                                float ry2 = std::min(1.0f, job.y2 + roi_h * face_roi_margin);
+                                int px1 = (int)(rx1 * frame.width());
+                                int py1 = (int)(ry1 * frame.height());
+                                int px2 = std::min(frame.width(),
+                                                   (int)(rx2 * frame.width() + 0.9999f));
+                                int py2 = std::min(frame.height(),
+                                                   (int)(ry2 * frame.height() + 0.9999f));
+                                int cw = px2 - px1, ch = py2 - py1;
+                                if (cw >= 16 && ch >= 16) {
+                                    char path[96];
+                                    snprintf(path, sizeof(path), "/tmp/roi_%.0f_%u.ppm",
+                                             now, job.track_id);
+                                    FILE* pf = fopen(path, "wb");
+                                    if (pf) {
+                                        fprintf(pf, "P6\n%d %d\n255\n", cw, ch);
+                                        for (int yy = 0; yy < ch; ++yy)
+                                            fwrite(rgb.data() +
+                                                       ((size_t)(py1 + yy) * frame.width() + px1) * 3,
+                                                   1, (size_t)cw * 3, pf);
+                                        fclose(pf);
+                                        printf("[DETDBG] saved %s crop=%dx%d track=%u raw_faces=%zu\n",
+                                               path, cw, ch, job.track_id, faces.size());
+                                    }
+                                }
+                            }
+
                             int selected = select_face_for_job(faces, job, fusion);
                             if (selected < 0) continue;
                             const FaceBox& face = faces[(size_t)selected];
@@ -659,26 +870,6 @@ int main(int argc, char* argv[]) {
                             int px2 = std::min(frame.width(), (int)(rx2 * frame.width() + 0.9999f));
                             int py2 = std::min(frame.height(), (int)(ry2 * frame.height() + 0.9999f));
                             int cw = px2 - px1, ch = py2 - py1;
-
-                            // 调试: 把 ROI 检测器输入裁块落盘 (PPM, RGB), 用于离线
-                            // 对照检测器行为; 每 5 秒最多一张, 仅 iva 任务。
-                            if (debug_dump_crops && job.rockiva_anchored &&
-                                now - last_crop_dump >= 5.0) {
-                                last_crop_dump = now;
-                                char path[96];
-                                snprintf(path, sizeof(path), "/tmp/roi_%.0f_%u.ppm",
-                                         now, job.track_id);
-                                FILE* pf = fopen(path, "wb");
-                                if (pf) {
-                                    fprintf(pf, "P6\n%d %d\n255\n", cw, ch);
-                                    for (int yy = 0; yy < ch; ++yy)
-                                        fwrite(rgb.data() + ((size_t)(py1 + yy) * frame.width() + px1) * 3,
-                                               1, (size_t)cw * 3, pf);
-                                    fclose(pf);
-                                    printf("[DETDBG] saved %s crop=%dx%d track=%u raw_faces=%zu\n",
-                                           path, cw, ch, job.track_id, faces.size());
-                                }
-                            }
                             BestFace& bf = best_faces[job.track_id];
                             if (cw >= 16 && ch >= 16) {
                                 bool replace = bf.crop_w <= 0;
@@ -779,6 +970,7 @@ int main(int argc, char* argv[]) {
                          "\"probable_tracks\":%d,\"confirmed_sessions\":%d,"
                          "\"rockiva_face_detections\":%llu,\"face_scan_attempts\":%llu,"
                          "\"roi_scans\":%llu,"
+                         "\"full_frame_scans\":%llu,\"full_frame_detections\":%llu,"
                          "\"retinaface_detections\":%llu,\"eligible_face_detections\":%llu,"
                          "\"face_track_matches\":%llu,\"embedding_successes\":%llu,"
                          "\"similarity_samples\":%llu,\"max_face_similarity\":%.4f,"
@@ -787,6 +979,7 @@ int main(int argc, char* argv[]) {
                          "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld%s}",
                           now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
                           schedule_start_text.c_str(), schedule_end_text.c_str(),
+                          full_frame_scans, full_frame_detections,
                           schedule.utc_offset_minutes,
                           level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
                           stats.temperature_c, p95,

@@ -43,13 +43,15 @@ COMMON_OBJ = $(SRC)/rknn_engine.o $(SRC)/face_detect.o $(SRC)/face_recog.o \
 MAIN_OBJ   = $(SRC)/main.o $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mqtt_publisher.o \
              $(SRC)/mpp_decoder.o $(SRC)/rockiva_detector.o $(SRC)/track_fusion.o \
              $(SRC)/system_monitor.o $(SRC)/schedule.o \
-             $(SRC)/video_ring.o $(SRC)/http_uploader.o $(SRC)/high_stream.o $(SRC)/nal_stats.o
+             $(SRC)/video_ring.o $(SRC)/http_uploader.o $(SRC)/high_stream.o $(SRC)/nal_stats.o \
+             $(SRC)/audio_ring.o $(SRC)/audio_util.o
 ENROLL_OBJ = $(SRC)/enroll.o
 DECTEST_OBJ = $(SRC)/decode_test.o $(SRC)/mpp_decoder.o $(SRC)/stb_impl.o
 PROBE_OBJ = $(SRC)/rockiva_probe.o $(SRC)/rockiva_detector.o $(SRC)/system_monitor.o \
             $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mpp_decoder.o
 # 4K 主码流测参工具: 只依赖 h264_source (含 H265), 不连 MPP/RKNN
-HSPROBE_OBJ = $(SRC)/high_stream_probe.o $(SRC)/nal_stats.o $(SRC)/h264_source.o
+HSPROBE_OBJ = $(SRC)/high_stream_probe.o $(SRC)/nal_stats.o $(SRC)/h264_source.o \
+              $(SRC)/audio_util.o
 FUSION_TEST_OBJ = $(SRC)/track_fusion_test.o $(SRC)/track_fusion.o
 SCHEDULE_TEST_OBJ = $(SRC)/schedule_test.o $(SRC)/schedule.o
 

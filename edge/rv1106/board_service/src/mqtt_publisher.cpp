@@ -83,6 +83,14 @@ bool MqttPublisher::do_connect() {
     ::freeaddrinfo(res);
     if (fd < 0) return false;
 
+    // 收发超时: NAS/网络异常时 publish 最多阻塞 3s 即断开重连,
+    // 防止主线程永久卡死 (曾实测 08-14 卡死 17.5h)。
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     fd_ = fd;

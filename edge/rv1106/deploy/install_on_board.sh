@@ -6,13 +6,20 @@ APP_DIR=/root/daughter_watch
 INIT_SCRIPT=/etc/init.d/S98daughter_watch
 ROLLBACK_DIR=/root/daughter_watch.rollback
 
-required="daughter_watch rockiva_probe track_fusion_test schedule_test librockiva.so models/face_detector.rknn models/mobilefacenet.rknn models/daughter.db models/rockiva/object_detection_pfp.data"
+required="daughter_watch run.sh rockiva_probe track_fusion_test schedule_test librockiva.so models/face_detector.rknn models/mobilefacenet.rknn models/daughter.db models/rockiva/object_detection_pfp.data"
 for path in $required; do
     [ -e "$PACKAGE_DIR/$path" ] || {
         echo "missing package file: $PACKAGE_DIR/$path" >&2
         exit 1
     }
 done
+
+# ffmpeg 是板端静态二进制 (不随包分发), 缺失时整条视频链路不工作, 但允许先装再补
+FFMPEG=/root/ffmpeg
+if [ ! -x "$FFMPEG" ]; then
+    echo "WARNING: $FFMPEG missing (ffmpeg 视频/音频管道无法启动)" >&2
+    echo "         安装后 run.sh 会拉起: stream1->high4k.fifo(4K) + high4k_audio.fifo(ADTS) + stream2->stdin" >&2
+fi
 
 "$INIT_SCRIPT" stop || true
 rm -rf "$ROLLBACK_DIR"
@@ -44,7 +51,7 @@ fi
 cp -p "$PACKAGE_DIR/daughter_watch" "$APP_DIR/daughter_watch.new"
 chmod +x "$APP_DIR/daughter_watch.new"
 mv -f "$APP_DIR/daughter_watch.new" "$APP_DIR/daughter_watch"
-[ -e "$PACKAGE_DIR/run.sh" ] && cp -p "$PACKAGE_DIR/run.sh" "$APP_DIR/run.sh"
+cp -p "$PACKAGE_DIR/run.sh" "$APP_DIR/run.sh"
 [ -e "$PACKAGE_DIR/S98daughter_watch" ] && cp -p "$PACKAGE_DIR/S98daughter_watch" "$INIT_SCRIPT"
 chmod +x "$APP_DIR/daughter_watch" "$APP_DIR/run.sh" "$INIT_SCRIPT"
 "$INIT_SCRIPT" start

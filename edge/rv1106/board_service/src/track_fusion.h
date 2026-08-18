@@ -27,6 +27,10 @@ struct FusionConfig {
     double probable_hold_seconds;
     double confirm_child_hold_seconds;
     double mqtt_update_seconds;
+    // 无脸儿童通道: child_like 轨迹在无露脸证据时, 需要活动量至少达到
+    // 该阈值才升 probable (0.0=关闭活动量要求)。区分"坐着的成人"与
+    // "活动中/走动中的儿童"。
+    float probable_min_activity;
     float face_threshold;
     float face_high_threshold;
 };
