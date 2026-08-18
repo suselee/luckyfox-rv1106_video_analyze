@@ -278,6 +278,50 @@ def _unique_path(path: Path) -> Path:
     raise RuntimeError(f"could not allocate unique path for {path}")
 
 
+def _moment_period(
+    started_at: datetime, boundaries_value: str
+) -> tuple[str, datetime, datetime] | None:
+    """阶段划分 (与 workers._moment_period 同构): morning/afternoon/evening。
+
+    返回 (label, start_dt, end_dt); 时间落在夜间 (21:00-07:00) 或无有效边界时
+    返回 None (该片段不受阶段上限约束, 仅受每日上限约束)。
+    """
+    parts = [part.strip() for part in boundaries_value.split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        minutes = []
+        for part in parts:
+            hour_text, minute_text = part.split(":", 1)
+            hour, minute = int(hour_text), int(minute_text)
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+            minutes.append(hour * 60 + minute)
+    except (TypeError, ValueError):
+        return None
+    if minutes != sorted(set(minutes)):
+        return None
+
+    current = started_at.hour * 60 + started_at.minute
+    labels = ("morning", "afternoon", "evening")
+    for index, label in enumerate(labels):
+        if minutes[index] <= current < minutes[index + 1]:
+            start = started_at.replace(
+                hour=minutes[index] // 60,
+                minute=minutes[index] % 60,
+                second=0,
+                microsecond=0,
+            )
+            end = started_at.replace(
+                hour=minutes[index + 1] // 60,
+                minute=minutes[index + 1] % 60,
+                second=0,
+                microsecond=0,
+            )
+            return label, start, end
+    return None
+
+
 async def save_ingested_clip(
     settings: Settings,
     database: Database,
@@ -306,10 +350,35 @@ async def save_ingested_clip(
     display_clip_end = clip_end_dt + display_offset
     day = display_clip_start.strftime("%Y-%m-%d")
 
-    # 产品规则: 只有确认女儿在场的视频才保存 (板端 probable 事件不算数)。
-    if identity != "confirmed":
+    # 产品规则: probable 是否保存由 RV1106_PROBABLE_POLICY 决定
+    # (accept=信任板端识别直接保存, verify/reject=不保存)。
+    if identity != "confirmed" and settings.rv1106_probable_policy != "accept":
         spool.remove(job_dir)
         return None
+
+    # 频率闸门 (纯 DB, 零 AI): 距最近一次已保存 moment 不足冷却窗口
+    # (RV1106_INGEST_COOLDOWN_SECONDS) 时丢弃, 与板端切片冷却互为兜底。
+    cooldown = getattr(settings, "rv1106_ingest_cooldown_seconds", 0) or 0
+    if cooldown > 0:
+        previous = database.nearest_moment_before(
+            display_clip_start.isoformat(timespec="milliseconds")
+        )
+        if previous is not None:
+            prev_key = str(previous.get("clip_started_at") or previous.get("created_at") or "")
+            try:
+                prev_dt = datetime.fromisoformat(prev_key)
+                gap = (display_clip_start - prev_dt).total_seconds()
+            except (TypeError, ValueError):
+                prev_dt = None
+                gap = None
+            if gap is not None and 0 <= gap < cooldown:
+                print(
+                    f"[INGEST] cooldown skip {key} gap={gap:.0f}s "
+                    f"clip_start={display_clip_start.isoformat()} prev={prev_key}",
+                    flush=True,
+                )
+                spool.remove(job_dir)
+                return None
 
     score = float(meta.get("score") or 0.5)
     activity_score = float(meta.get("activity_score") or 0.0)
@@ -334,9 +403,28 @@ async def save_ingested_clip(
     clip_path = _unique_path(day_dir / f"{display_clip_start.strftime('%H%M%S')}_{title_slug}.mp4")
     metadata_path = clip_path.with_suffix(".json")
 
-    # 每日上限: 超出时只有比当天最弱片段更强才允许保存, 并移除最弱片段
-    # (评分 = selection_score, 与 NAS 分析管线共用同一每日池)。
-    evict_moment = None
+    # 阶段上限 + 每日上限: 超限时只有比该范围内最弱片段更强才允许保存,
+    # 并移除最弱片段 (评分 = selection_score, 与 NAS 分析管线共用同一池)。
+    evictions: list[dict[str, Any]] = []
+    if settings.max_moments_per_period:
+        period = _moment_period(display_clip_start, settings.moment_period_boundaries)
+        if period is not None:
+            start_iso = period[1].isoformat(timespec="milliseconds")
+            end_iso = period[2].isoformat(timespec="milliseconds")
+            count_period = database.count_moments_between(start_iso, end_iso)
+            if count_period >= settings.max_moments_per_period:
+                weakest = database.weakest_moment_between(start_iso, end_iso)
+                weakest_score = (
+                    float(weakest.get("selection_score") or weakest.get("confidence") or 0.0)
+                    if weakest
+                    else 0.0
+                )
+                if weakest and selection_score > weakest_score:
+                    evictions.append(weakest)
+                else:
+                    spool.remove(job_dir)
+                    return None
+
     if settings.max_moments_per_day:
         count_day = database.count_moments_on_day(day)
         if count_day >= settings.max_moments_per_day:
@@ -347,7 +435,8 @@ async def save_ingested_clip(
                 else 0.0
             )
             if weakest and selection_score > weakest_score:
-                evict_moment = weakest
+                if not any(item["id"] == weakest["id"] for item in evictions):
+                    evictions.append(weakest)
             else:
                 spool.remove(job_dir)
                 return None
@@ -386,67 +475,74 @@ async def save_ingested_clip(
             )
         os.replace(staged_clip_path, clip_path)
 
-    # 新片段已安全落盘; 现在移除被替换的当天最弱片段 (文件 + DB 记录)。
-    if evict_moment is not None:
-        for key in ("clip_path", "metadata_path"):
-            Path(evict_moment[key]).unlink(missing_ok=True)
+    # 新片段已安全落盘; 现在移除被替换的最弱片段 (文件 + DB 记录)。
+    for evict_moment in evictions:
+        for path_key in ("clip_path", "metadata_path"):
+            path = evict_moment.get(path_key)
+            if path:
+                Path(path).unlink(missing_ok=True)
         database.delete_moment_record(evict_moment["id"])
 
-    metadata = {
-        "schema_version": 3,
-        "owner": "nas",
-        "camera_name": camera_name,
-        "analysis_backend": "rv1106_edge",
-        "category": category,
-        "title": title,
-        "summary": summary,
-        "tags": tags,
-        "confidence": min(1.0, max(0.0, score)),
-        "selection_score": selection_score,
-        "keep_consistency_repaired": False,
-        "local_child_confirmed": confirmed,
-        "local_child_score": score,
-        "source": "board_high_ring",
-        "source_stream_role": "board",
-        "source_started_at": display_clip_start.isoformat(timespec="seconds"),
-        "source_ended_at": display_clip_end.isoformat(timespec="seconds"),
-        "clip_start": display_clip_start.isoformat(timespec="seconds"),
-        "clip_end": display_clip_end.isoformat(timespec="seconds"),
-        "clip_duration_seconds": max(1.0, (display_clip_end - display_clip_start).total_seconds()),
-        "source_paths": [str(video_path)],
-        "model_raw": meta,
-        "event_id": None,
-        "event_key": key,
-    }
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+            metadata = {
+                "schema_version": 3,
+                "owner": "nas",
+                "camera_name": camera_name,
+                "analysis_backend": "rv1106_edge",
+                "category": category,
+                "title": title,
+                "summary": summary,
+                "tags": tags,
+                "confidence": min(1.0, max(0.0, score)),
+                "selection_score": selection_score,
+                "keep_consistency_repaired": False,
+                "local_child_confirmed": confirmed,
+                "local_child_score": score,
+                "source": "board_high_ring",
+                "source_stream_role": "board",
+                "source_started_at": display_clip_start.isoformat(timespec="seconds"),
+                "source_ended_at": display_clip_end.isoformat(timespec="seconds"),
+                "clip_start": display_clip_start.isoformat(timespec="seconds"),
+                "clip_end": display_clip_end.isoformat(timespec="seconds"),
+                "clip_duration_seconds": max(1.0, (display_clip_end - display_clip_start).total_seconds()),
+                "source_paths": [str(video_path)],
+                "model_raw": meta,
+                "event_id": None,
+                "event_key": key,
+            }
+            metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    moment_id = database.create_moment(
-        camera_name=camera_name,
-        title=title,
-        summary=summary,
-        tags=tags,
-        confidence=score,
-        source_low_segment_id=None,
-        source_started_at=display_clip_start.isoformat(timespec="seconds"),
-        source_ended_at=display_clip_end.isoformat(timespec="seconds"),
-        clip_path=clip_path,
-        metadata_path=metadata_path,
-        analysis_backend="rv1106_edge",
-        category=category,
-        selection_score=selection_score,
-        clip_started_at=display_clip_start.isoformat(timespec="seconds"),
-        clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
-        trigger_key=key,
-        source_segment_id=None,
-        source_stream_role="board",
-    )
-    metadata["event_id"] = moment_id
-    metadata["daily_summary_path"] = str(day_dir / "summary.md")
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            moment_id = database.create_moment(
+                camera_name=camera_name,
+                title=title,
+                summary=summary,
+                tags=tags,
+                confidence=score,
+                source_low_segment_id=None,
+                source_started_at=display_clip_start.isoformat(timespec="seconds"),
+                source_ended_at=display_clip_end.isoformat(timespec="seconds"),
+                clip_path=clip_path,
+                metadata_path=metadata_path,
+                analysis_backend="rv1106_edge",
+                category=category,
+                selection_score=selection_score,
+                clip_started_at=display_clip_start.isoformat(timespec="seconds"),
+                clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
+                trigger_key=key,
+                source_segment_id=None,
+                source_stream_role="board",
+            )
+            metadata["event_id"] = moment_id
+            metadata["daily_summary_path"] = str(day_dir / "summary.md")
+            metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    rebuild_day_archive(settings, database, day)
-    database.record_ingested_done(key, moment_id)
-    spool.remove(job_dir)
+            rebuild_day_archive(settings, database, day)
+            database.record_ingested_done(key, moment_id)
+            spool.remove(job_dir)
+    except Exception:
+        Path(clip_path).unlink(missing_ok=True)
+        Path(metadata_path).unlink(missing_ok=True)
+        raise
     return moment_id
 
 

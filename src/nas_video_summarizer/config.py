@@ -236,6 +236,7 @@ class Settings:
     rv1106_session_timeout_seconds: float
     rv1106_save_wait_seconds: float
     rv1106_probable_policy: str
+    rv1106_ingest_cooldown_seconds: float
     rv1106_accept_probable: bool
     rv1106_verify_roi_width_scale: float
     rv1106_verify_roi_height_scale: float
@@ -397,6 +398,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
             "RV1106_SESSION_TIMEOUT_SECONDS", 20.0
         ),
         rv1106_save_wait_seconds=_float("RV1106_SAVE_WAIT_SECONDS", 180.0),
+        rv1106_ingest_cooldown_seconds=_float(
+            "RV1106_INGEST_COOLDOWN_SECONDS", 300.0
+        ),
         rv1106_probable_policy=rv1106_probable_policy,
         rv1106_accept_probable=rv1106_probable_policy != "reject",
         rv1106_verify_roi_width_scale=_float(
