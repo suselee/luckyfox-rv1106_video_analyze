@@ -26,7 +26,7 @@ from typing import Any
 from .archive import rebuild_day_archive
 from .config import Settings
 from .database import Database
-from .ffmpeg_tools import remux_elementary_stream
+from .ffmpeg_tools import extract_cropped_frame, remux_elementary_stream
 
 
 @dataclass(frozen=True)
@@ -322,15 +322,112 @@ def _moment_period(
     return None
 
 
+def _normalized_board_roi(
+    meta: dict[str, Any],
+    *,
+    width_scale: float,
+    height_scale: float,
+) -> tuple[float, float, float, float] | None:
+    """把板端像素 best_box 映射为裁剪用的归一化扩展 ROI (与 workers 同构)。"""
+    raw_box = meta.get("best_box") or meta.get("box")
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+        return None
+    try:
+        x, y, width, height = (float(value) for value in raw_box)
+        frame_width = float(meta.get("frame_width") or 640)
+        frame_height = float(meta.get("frame_height") or 360)
+    except (TypeError, ValueError):
+        return None
+    if frame_width <= 0 or frame_height <= 0 or width <= 0 or height <= 0:
+        return None
+
+    left = x / frame_width
+    top = y / frame_height
+    box_width = width / frame_width
+    box_height = height / frame_height
+    center_x = left + box_width / 2
+    center_y = top + box_height / 2
+    expanded_width = min(1.0, box_width * max(1.0, width_scale))
+    expanded_height = min(1.0, box_height * max(1.0, height_scale))
+    roi_left = max(0.0, center_x - expanded_width / 2)
+    roi_top = max(0.0, center_y - expanded_height / 2)
+    roi_right = min(1.0, center_x + expanded_width / 2)
+    roi_bottom = min(1.0, center_y + expanded_height / 2)
+    if roi_right <= roi_left or roi_bottom <= roi_top:
+        return None
+    return roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top
+
+
+async def _verify_probable_clip(
+    settings: Settings,
+    video_path: Path,
+    meta: dict[str, Any],
+    detector: Any,
+) -> tuple[bool, str]:
+    """对板端上传切片自身抽帧校验是否含儿童证据。
+
+    从切片时长内均匀取 5 帧, 按轨迹 ROI 裁剪后交给 DaughterDetector
+    的 verify_board_probable_paths: 儿童人脸/ONNX 证据接受; 连续成人脸
+    或无人在场拒绝; 无脸但人物稳定且板端分数强则按高召回放行。
+    返回 (accepted, decision)。
+    """
+    roi = _normalized_board_roi(
+        meta,
+        width_scale=settings.rv1106_verify_roi_width_scale,
+        height_scale=settings.rv1106_verify_roi_height_scale,
+    )
+    if roi is None:
+        return True, "invalid_roi_fallback"
+    clip_start = float(meta.get("clip_start") or 0.0)
+    clip_end = float(meta.get("clip_end") or 0.0)
+    duration = max(0.0, clip_end - clip_start)
+    if duration <= 0:
+        return True, "invalid_duration_fallback"
+    offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
+    with tempfile.TemporaryDirectory(prefix="nas-video-clip-verify-") as temp_dir:
+        frames = []
+        for index, offset in enumerate(offsets, start=1):
+            frame_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
+            await extract_cropped_frame(
+                settings,
+                video_path,
+                frame_path,
+                offset,
+                roi=roi,
+                output_width=settings.rv1106_verify_frame_width,
+            )
+            if frame_path.exists():
+                frames.append(frame_path)
+        if not frames:
+            # 切片解不出帧: 无法证伪, 宁多存。
+            return True, "no_frames_fallback"
+        verification = detector.verify_board_probable_paths(
+            frames,
+            required_frames=2,
+            required_person_frames=settings.rv1106_verify_person_frames,
+            board_score=float(meta.get("score") or 0.0),
+            board_person_score=float(meta.get("person_score") or 0.0),
+            board_score_threshold=settings.rv1106_verify_board_score,
+            board_person_score_threshold=(
+                settings.rv1106_verify_board_person_score
+            ),
+        )
+        return verification.accepted, verification.decision
+
+
 async def save_ingested_clip(
     settings: Settings,
     database: Database,
     spool: IngestSpool,
     job_dir: Path,
+    *,
+    probable_verifier: Any = None,
 ) -> int | None:
     """把排队的板端上传转成最终 moment, 返回 moment id (或 None 表示跳过)。
 
     失败抛异常, 由 worker 记错误次数; 成功时同时落 DB 并清掉 spool 目录。
+    probable_verifier: 可选 DaughterDetector 实例; RV1106_PROBABLE_POLICY=verify
+    时用它对上传切片自身抽帧校验 (board-primary 模式没有 NAS 录像段可查)。
     """
     meta = spool.job_meta(job_dir)
     key = ingest_event_key(meta)
@@ -351,10 +448,32 @@ async def save_ingested_clip(
     day = display_clip_start.strftime("%Y-%m-%d")
 
     # 产品规则: probable 是否保存由 RV1106_PROBABLE_POLICY 决定
-    # (accept=信任板端识别直接保存, verify/reject=不保存)。
-    if identity != "confirmed" and settings.rv1106_probable_policy != "accept":
+    # (accept=信任板端识别直接保存, verify=抽帧校验后决定, reject=不保存)。
+    if identity != "confirmed" and settings.rv1106_probable_policy == "reject":
         spool.remove(job_dir)
         return None
+    if (
+        identity != "confirmed"
+        and settings.rv1106_probable_policy == "verify"
+    ):
+        if probable_verifier is None:
+            # 校验器不可用 (OpenCV/模型缺失): 宁多存, 放行并留痕。
+            print(
+                f"[INGEST] verify skipped (no verifier) {key}; accepting",
+                flush=True,
+            )
+        else:
+            accepted, decision = await _verify_probable_clip(
+                settings, video_path, meta, probable_verifier
+            )
+            if not accepted:
+                print(
+                    f"[INGEST] verify reject {key} decision={decision}",
+                    flush=True,
+                )
+                spool.remove(job_dir)
+                return None
+            print(f"[INGEST] verify accept {key} decision={decision}", flush=True)
 
     # 频率闸门 (纯 DB, 零 AI): 距最近一次已保存 moment 不足冷却窗口
     # (RV1106_INGEST_COOLDOWN_SECONDS) 时丢弃, 与板端切片冷却互为兜底。

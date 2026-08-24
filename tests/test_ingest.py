@@ -324,8 +324,13 @@ def _save_clip(tmp_path, monkeypatch, meta, settings=None, database=None):
 
 
 def test_save_ingested_clip_skips_probable_identity(tmp_path, monkeypatch):
+    # reject 策略: probable 上传直接清理, 不保存 (当前默认 accept,
+    # verify 走抽帧校验, 各有独立用例)。
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="reject")
     meta = dict(SAMPLE_META, session_id="9-9", identity="probable")
-    moment_id, database, spool, job_dir = _save_clip(tmp_path, monkeypatch, meta)
+    moment_id, database, spool, job_dir = _save_clip(
+        tmp_path, monkeypatch, meta, settings
+    )
     assert moment_id is None
     assert not job_dir.exists()  # probable 上传直接清理, 不保存
     assert database.count_moments_on_day("2025-06-15") == 0
@@ -333,7 +338,12 @@ def test_save_ingested_clip_skips_probable_identity(tmp_path, monkeypatch):
 
 
 def test_save_ingested_clip_daily_cap_replaces_weakest(tmp_path, monkeypatch):
-    settings = replace(_make_settings(tmp_path), max_moments_per_day=1)
+    # 冷却闸门会拦截同刻片段, 本用例只验证每日上限的弱换强, 显式关闭。
+    settings = replace(
+        _make_settings(tmp_path),
+        max_moments_per_day=1,
+        rv1106_ingest_cooldown_seconds=0,
+    )
     database = Database(settings.database_path)
     database.migrate()
 
@@ -516,3 +526,130 @@ def test_save_ingested_clip_audio_failure_falls_back_to_video_only(tmp_path, mon
     assert attempts[1] is None
     clip = database.get_moment(moment_id)
     assert Path(clip["clip_path"]).read_bytes() == VIDEO_BYTES
+
+
+def _probable_meta() -> dict:
+    return dict(
+        SAMPLE_META,
+        identity="probable",
+        event="end",
+        score=0.75,
+        face_score=0.0,
+        person_score=0.9,
+        activity_score=0.3,
+    )
+
+
+class _FakeVerification:
+    def __init__(self, accepted: bool, decision: str):
+        self.accepted = accepted
+        self.decision = decision
+
+
+class _FakeVerifier:
+    def __init__(self, accepted: bool, decision: str = "child_face"):
+        self.accepted = accepted
+        self.decision = decision
+        self.calls: list[list[Path]] = []
+
+    def verify_board_probable_paths(self, paths, **kwargs):
+        self.calls.append(list(paths))
+        return _FakeVerification(self.accepted, self.decision)
+
+
+def test_save_ingested_clip_verify_accepts_probable(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(_probable_meta(), VIDEO_BYTES)
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+
+    async def fake_extract(settings_, video_path_, output_path, offset, *, roi, output_width):
+        output_path.write_bytes(b"jpg")
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+    monkeypatch.setattr(ingest_module, "extract_cropped_frame", fake_extract)
+
+    verifier = _FakeVerifier(accepted=True)
+    moment_id = asyncio.run(
+        save_ingested_clip(settings, database, spool, job_dir, probable_verifier=verifier)
+    )
+    assert moment_id is not None
+    assert len(verifier.calls) == 1
+    assert len(verifier.calls[0]) == 5  # 均匀抽 5 帧
+    assert not job_dir.exists()
+
+
+def test_save_ingested_clip_verify_rejects_adult_probable(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(_probable_meta(), VIDEO_BYTES)
+
+    async def fake_extract(settings_, video_path_, output_path, offset, *, roi, output_width):
+        output_path.write_bytes(b"jpg")
+
+    monkeypatch.setattr(ingest_module, "extract_cropped_frame", fake_extract)
+
+    verifier = _FakeVerifier(accepted=False, decision="adult_face")
+    moment_id = asyncio.run(
+        save_ingested_clip(settings, database, spool, job_dir, probable_verifier=verifier)
+    )
+    assert moment_id is None
+    assert not job_dir.exists()  # 拒绝后清理 spool
+    assert database.count_ingested_done() == 0
+
+
+def test_save_ingested_clip_verify_fail_open_without_verifier(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(_probable_meta(), VIDEO_BYTES)
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+
+    # 无校验器 (OpenCV 缺失等): 宁多存, 放行。
+    moment_id = asyncio.run(
+        save_ingested_clip(settings, database, spool, job_dir, probable_verifier=None)
+    )
+    assert moment_id is not None
+
+
+def test_save_ingested_clip_verify_confirmed_skips_verification(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(dict(SAMPLE_META), VIDEO_BYTES)  # identity=confirmed
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+
+    verifier = _FakeVerifier(accepted=False)  # 若被调用将拒绝
+    moment_id = asyncio.run(
+        save_ingested_clip(settings, database, spool, job_dir, probable_verifier=verifier)
+    )
+    assert moment_id is not None
+    assert verifier.calls == []  # confirmed 不走校验

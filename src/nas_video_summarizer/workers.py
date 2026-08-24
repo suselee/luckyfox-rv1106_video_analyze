@@ -711,7 +711,16 @@ class Supervisor:
                 for job_dir in jobs:
                     try:
                         moment_id = await save_ingested_clip(
-                            self.settings, self.database, spool, job_dir
+                            self.settings,
+                            self.database,
+                            spool,
+                            job_dir,
+                            probable_verifier=(
+                                self._get_board_probable_detector()
+                                if self.settings.rv1106_probable_policy
+                                == "verify"
+                                else None
+                            ),
                         )
                         if moment_id is not None:
                             self._board_ingest_last_moment_id = moment_id
