@@ -326,6 +326,8 @@ int main(int argc, char* argv[]) {
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 15.0);
     fusion_cfg.probable_min_activity = (float)cfg.get_double(
         "pipeline.probable_min_activity", 0.20);
+    fusion_cfg.adult_tall_observations = cfg.get_int(
+        "pipeline.adult_tall_observations", 3);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
@@ -361,6 +363,7 @@ int main(int argc, char* argv[]) {
     high_cfg.upload_timeout = cfg.get_double("upload.upload_timeout_seconds", 30.0);
     high_cfg.max_queue = cfg.get_int("upload.max_queue", 8);
     high_cfg.min_interval_seconds = cfg.get_double("upload.min_interval_seconds", 300.0);
+    high_cfg.tail_trim_seconds = cfg.get_double("upload.tail_trim_seconds", 2.0);
     high_cfg.camera_id = camera_id;
     if (!high_cfg.rtsp_url.empty() && !high_cfg.upload_url.empty()) {
         high_cfg.enabled = true;

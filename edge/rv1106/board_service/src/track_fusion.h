@@ -31,6 +31,12 @@ struct FusionConfig {
     // 该阈值才升 probable (0.0=关闭活动量要求)。区分"坐着的成人"与
     // "活动中/走动中的儿童"。
     float probable_min_activity;
+    // 成人先验否决: 同一轨迹连续 >= 该次数观测到身高超过
+    // child_max_height_ratio (站立/行走体态), 则判定为成人先验并粘滞,
+    // 之后该轨迹不得再经无脸几何通道升级 probable (坐下后体型近似儿童,
+    // 活动量瞬时达标即锁存是本次误报根因)。仅 >= face_high_threshold 的
+    // 强人脸确认不受影响。0=禁用。
+    int adult_tall_observations;
     float face_threshold;
     float face_high_threshold;
 };
@@ -47,6 +53,9 @@ struct FusionEvent {
     float face_score;
     float person_score;
     float activity_score;
+    // 精彩度选峰: 活动量 EMA 峰值时刻 / 最后一次活跃时刻 (秒, 进程时钟)。
+    double activity_peak_ts;
+    double last_active_ts;
     IvaObject box;
     IvaObject best_box;
     int people_count;
@@ -114,6 +123,17 @@ private:
         bool needs_revalidation;
         bool child_like;
         bool session_active;
+        // 成人先验状态: 连续 tall_streak 次身高超阈值后 adult_prior 粘滞。
+        int tall_streak;
+        bool adult_prior;
+        // 精彩度选峰: 活动 EMA 峰值与最后活跃时刻 (Q1/Q2)。
+        float activity_peak;
+        double activity_peak_ts;
+        double last_active_ts;
+        // 最近一次满足 probable 证据 (人脸命中或 child_like 且活动量达标)
+        // 的时刻; probable 在该时刻的 probable_hold_seconds 内保持粘滞,
+        // 容忍短暂分类抖动 (wobble) 而不掉级、不断会话。
+        double last_probable_evidence;
         IdentityLevel identity;
         IdentityLevel published_identity;
         std::string session_id;

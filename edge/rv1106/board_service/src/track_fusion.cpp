@@ -76,6 +76,9 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.previous_cx = (person.x1 + person.x2) * 0.5f;
             track.previous_cy = (person.y1 + person.y2) * 0.5f;
             track.observations = 1;
+            track.tall_streak = 0;
+            track.adult_prior = false;
+            track.last_probable_evidence = -1e9;
             track.identity = IDENTITY_UNKNOWN;
             tracks_[track.id] = track;
             selected = &tracks_[track.id];
@@ -89,6 +92,13 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
                 track.activity_score * 0.8f + std::min(1.0f, movement * 8.0f) * 0.2f);
             track.previous_cx = cx;
             track.previous_cy = cy;
+            // Q1 选峰: 记录活动 EMA 峰值时刻; Q2 裁尾: 记录最后活跃时刻。
+            if (track.activity_score >= track.activity_peak) {
+                track.activity_peak = track.activity_score;
+                track.activity_peak_ts = now;
+            }
+            if (track.activity_score >= config_.probable_min_activity)
+                track.last_active_ts = now;
             track.box = person;
             track.source_id = person.id;
             track.last_seen = now;
@@ -98,6 +108,16 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         Track& track = *selected;
         matched_ids.push_back(track.id);
         float height = person.y2 - person.y1;
+        // 成人先验: 站立/行走体态连续可见即粘滞标记 (坐下的成人身高会
+        // 跌破 child_max_height_ratio, 与儿童体型无法区分, 必须靠"曾站
+        // 立"这一历史证据否决无脸几何通道)。
+        if (config_.adult_tall_observations > 0 &&
+            height > config_.child_max_height_ratio) {
+            if (++track.tall_streak >= config_.adult_tall_observations)
+                track.adult_prior = true;
+        } else {
+            track.tall_streak = 0;
+        }
         bool absolute_child = height >= 0.12f && height <= config_.child_max_height_ratio;
         bool relative_child = detections.people.size() > 1 && tallest > 0 &&
                               height <= tallest * config_.relative_child_height_ratio;
@@ -225,10 +245,23 @@ void TrackFusion::update_identity(Track& track, double now) {
         //  - 无脸儿童通道: 活动量持续足够高的 child_like 轨迹也升
         //    probable (女儿玩耍/跑动时不常露清晰正脸; 坐着的成人体型
         //    近似儿童但活动量低, 用 probable_min_activity 区分)。
-        bool face_evidence = track.face_score >= config_.face_threshold;
-        bool active_child = track.child_like &&
-            track.activity_score >= config_.probable_min_activity;
-        if (face_evidence || active_child) {
+        // 两条通道都被 adult_prior 否决: 走入画面后坐下的成人会在
+        // "身高跌破阈值 x 活动量尚未衰减"的瞬间达标锁存 (8/24 误报:
+        // 用户坐沙发找东西, face_score=0 却保存 5 条), 站立史是唯一
+        // 可靠的成人证据。强人脸确认 (>= high_threshold) 不受影响。
+        // 证据满足时刷新 last_probable_evidence, probable 在
+        // probable_hold_seconds 内保持粘滞 —— 单次分类抖动 (儿童短暂
+        // 站起/被抱高) 不得掉级断会话, 但静坐不动的轨迹会自然衰减。
+        bool evidence_now = !track.adult_prior &&
+            (track.face_score >= config_.face_threshold ||
+             (track.child_like &&
+              track.activity_score >= config_.probable_min_activity));
+        if (evidence_now) track.last_probable_evidence = now;
+        bool face_evidence = evidence_now;
+        bool held_recently = !track.adult_prior &&
+            now - track.last_probable_evidence <=
+                config_.probable_hold_seconds;
+        if (face_evidence || held_recently) {
             track.identity = IDENTITY_PROBABLE;
         } else {
             track.identity = IDENTITY_UNKNOWN;
@@ -277,6 +310,8 @@ FusionEvent TrackFusion::make_event(const Track& track, const char* event, doubl
     out.face_score = track.face_score;
     out.person_score = track.person_score;
     out.activity_score = track.activity_score;
+    out.activity_peak_ts = track.activity_peak_ts;
+    out.last_active_ts = track.last_active_ts;
     out.score = reported == IDENTITY_CONFIRMED
         ? std::max(track.face_score, config_.face_threshold)
         : std::min(0.75f, 0.50f + 0.02f * track.observations);

@@ -263,31 +263,36 @@ void HighStream::make_clip(const FusionEvent& ev) {
         return;
     }
 
-    // 事件窗口: session 开始前 context_before, 峰值时刻后 context_after;
-    // 超出 max_clip_seconds 时压缩后窗 (最少 min_clip_seconds)。
-    double t0 = ev.session_start;
-    double t1 = ev.best_timestamp > 0 ? ev.best_timestamp : ev.timestamp;
-    double dur = t1 - t0;
-    double max_after = cfg_.max_clip_seconds - dur - cfg_.context_before;
-    double after = std::max(cfg_.min_clip_seconds,
-                            std::min(cfg_.context_after, max_after));
-    if (max_after < cfg_.min_clip_seconds) {
-        printf("[HIGH] window too long (%.1fs), skip session=%s\n",
-               dur + cfg_.context_before + cfg_.context_after,
-               ev.session_id.c_str());
+    // 事件窗口: 以活动峰值时刻为中心 (Q1), 前后各取上下文;
+    // 超长会话不再整段丢弃 —— 钳制出 <=max_clip_seconds 的峰值居中窗口。
+    double center = ev.activity_peak_ts > 0
+        ? ev.activity_peak_ts
+        : (ev.best_timestamp > 0 ? ev.best_timestamp : ev.timestamp);
+    double ws = center - cfg_.context_before;
+    double we = center + cfg_.context_after;
+    // Q2 尾部裁剪: 人离开/静止后不拖尾巴。
+    if (ev.last_active_ts > 0)
+        we = std::min(we, ev.last_active_ts + cfg_.tail_trim_seconds);
+    // 钳制到环形缓冲实际覆盖范围, 保证至少 min_clip_seconds。
+    ws = std::max(ws, ring_.oldest_ts());
+    we = std::min(we, ring_.newest_ts());
+    if (we - ws < cfg_.min_clip_seconds) {
+        stats_.cut_reject++;
+        printf("[HIGH] cut rejected (%d) session=%s window=[%.1f,%.1f] ring=[%.1f,%.1f]\n",
+               (int)CutResult::EMPTY_WINDOW, ev.session_id.c_str(),
+               ws, we, ring_.oldest_ts(), ring_.newest_ts());
         return;
     }
-    double before = cfg_.context_before;
 
     size_t max_bytes = (size_t)(cfg_.max_clip_seconds * 2 * 1024 * 1024);
     std::vector<uint8_t> clip;
     double eff_start = 0.0, eff_end = 0.0;
-    CutResult rc = ring_.cut(t0, t1, before, after, cfg_.gap_limit,
+    CutResult rc = ring_.cut(ws, we, 0.0, 0.0, cfg_.gap_limit,
                              max_bytes, clip, &eff_start, &eff_end);
     if (rc != CutResult::OK) {
         stats_.cut_reject++;
         printf("[HIGH] cut rejected (%d) session=%s window=[%.1f,%.1f] ring=[%.1f,%.1f]\n",
-               (int)rc, ev.session_id.c_str(), t0 - before, t1 + after,
+               (int)rc, ev.session_id.c_str(), ws, we,
                ring_.oldest_ts(), ring_.newest_ts());
         return;
     }
@@ -313,7 +318,7 @@ void HighStream::make_clip(const FusionEvent& ev) {
         }
     }
 
-    std::string meta = meta_json(ev, t0 - before, t1 + after, clip.size());
+    std::string meta = meta_json(ev, ws, we, clip.size());
     PendingClip pc;
     pc.data.swap(clip);
     pc.meta_json.swap(meta);
@@ -338,12 +343,13 @@ void HighStream::make_clip(const FusionEvent& ev) {
 
 std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
                                   double clip_end, size_t clip_bytes) {
-    char buf[1280];
+    char buf[1400];
     snprintf(buf, sizeof(buf),
              "{\"session_id\":\"%s\",\"event\":\"%s\",\"identity\":\"%s\","
              "\"track_id\":%u,\"ts\":%.3f,\"session_start\":%.3f,"
              "\"best_ts\":%.3f,\"score\":%.4f,\"face_score\":%.4f,"
              "\"person_score\":%.4f,\"activity_score\":%.4f,"
+             "\"activity_peak_ts\":%.3f,\"last_active_ts\":%.3f,"
              "\"box\":[%.4f,%.4f,%.4f,%.4f],\"best_box\":[%.4f,%.4f,%.4f,%.4f],"
              "\"people_count\":%d,\"camera_id\":\"%s\","
              "\"clip_start\":%.3f,\"clip_end\":%.3f,\"clip_bytes\":%zu,"
@@ -353,6 +359,7 @@ std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
              ev.session_id.c_str(), ev.event.c_str(), ev.identity.c_str(),
              ev.track_id, ev.timestamp, ev.session_start, ev.best_timestamp,
              ev.score, ev.face_score, ev.person_score, ev.activity_score,
+             ev.activity_peak_ts, ev.last_active_ts,
              ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2,
              ev.best_box.x1, ev.best_box.y1, ev.best_box.x2, ev.best_box.y2,
              ev.people_count, cfg_.camera_id.c_str(),

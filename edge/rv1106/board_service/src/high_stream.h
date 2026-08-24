@@ -34,6 +34,8 @@ struct HighStreamConfig {
     std::string camera_id;
     double min_clip_seconds = 3.0;
     double min_interval_seconds = 300.0; // 两次切片上传之间最短间隔 (全局冷却)
+    // Q2 尾部裁剪: clip 末端收到 last_active_ts + 该秒数, 去掉人走后的静默。
+    double tail_trim_seconds = 2.0;
 };
 
 struct UploadStats {
