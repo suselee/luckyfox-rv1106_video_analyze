@@ -390,21 +390,21 @@ async def _verify_probable_clip(
         height_scale=settings.rv1106_verify_roi_height_scale,
     )
     if roi is None:
-        return True, "invalid_roi_fallback"
+        return True, "invalid_roi_fallback", None
     clip_start = float(meta.get("clip_start") or 0.0)
     clip_end = float(meta.get("clip_end") or 0.0)
     duration = max(0.0, clip_end - clip_start)
     if duration <= 0:
-        return True, "invalid_duration_fallback"
+        return True, "invalid_duration_fallback", None
     with tempfile.TemporaryDirectory(prefix="nas-video-clip-verify-") as temp_dir:
         mp4_path = Path(temp_dir) / "clip.mp4"
         try:
             await remux_elementary_stream(settings, video_path, mp4_path)
         except Exception as exc:
             print(f"[INGEST] verify remux failed: {exc}", flush=True)
-            return True, "remux_failed_fallback"
+            return True, "remux_failed_fallback", None
         if not mp4_path.exists() or mp4_path.stat().st_size == 0:
-            return True, "empty_remux_fallback"
+            return True, "empty_remux_fallback", None
         offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
         frames = []
         for index, offset in enumerate(offsets, start=1):
@@ -421,7 +421,7 @@ async def _verify_probable_clip(
                 frames.append(frame_path)
         if not frames:
             # 切片解不出帧: 无法证伪, 宁多存。
-            return True, "no_frames_fallback"
+            return True, "no_frames_fallback", None
         verification = detector.verify_board_probable_paths(
             frames,
             required_frames=2,
@@ -433,7 +433,7 @@ async def _verify_probable_clip(
                 settings.rv1106_verify_board_person_score
             ),
         )
-        return verification.accepted, verification.decision
+        return verification.accepted, verification.decision, verification
 
 
 async def save_ingested_clip(
@@ -473,20 +473,26 @@ async def save_ingested_clip(
     if identity != "confirmed" and settings.rv1106_probable_policy == "reject":
         spool.remove(job_dir)
         return None
+    # 儿童证据分 (Q4): confirmed=1.0 (板端人脸命中); probable 经 NAS 安检
+    # 按证据映射; 校验器缺失等 fail-open 取中性偏宽 0.5。
+    child_evidence = 1.0 if identity == "confirmed" else None
+    verify_decision = None
     if (
         identity != "confirmed"
         and settings.rv1106_probable_policy == "verify"
     ):
         if probable_verifier is None:
             # 校验器不可用 (OpenCV/模型缺失): 宁多存, 放行并留痕。
+            child_evidence = 0.5
             print(
                 f"[INGEST] verify skipped (no verifier) {key}; accepting",
                 flush=True,
             )
         else:
-            accepted, decision = await _verify_probable_clip(
+            accepted, decision, verification = await _verify_probable_clip(
                 settings, video_path, meta, probable_verifier
             )
+            verify_decision = decision
             if not accepted:
                 print(
                     f"[INGEST] verify reject {key} decision={decision}",
@@ -494,7 +500,14 @@ async def save_ingested_clip(
                 )
                 spool.remove(job_dir)
                 return None
+            if decision in {"child_face", "daughter_onnx"}:
+                child_evidence = 1.0
+            elif decision == "faceless_person":
+                child_evidence = 0.6
             print(f"[INGEST] verify accept {key} decision={decision}", flush=True)
+    if child_evidence is None:
+        # policy=accept: 信任板端判定, 无 NAS 证据时取中性偏宽。
+        child_evidence = 0.5
 
     # 频率闸门 (纯 DB, 零 AI): 距最近一次已保存 moment 不足冷却窗口
     # (RV1106_INGEST_COOLDOWN_SECONDS) 时丢弃, 与板端切片冷却互为兜底。
@@ -523,8 +536,13 @@ async def save_ingested_clip(
     score = float(meta.get("score") or 0.5)
     activity_score = float(meta.get("activity_score") or 0.0)
     face_score = float(meta.get("face_score") or 0.0)
-    selection_score = min(1.0, score * 0.75 + activity_score * 0.25)
+    # Q4 三权重: 板端身份 0.6 + 活动量 0.25 + NAS 儿童证据 0.15,
+    # 打破 probables 全员同分的排序平局。
+    selection_score = min(
+        1.0, score * 0.6 + activity_score * 0.25 + child_evidence * 0.15
+    )
     confirmed = identity == "confirmed" or face_score >= 0.5
+    verified_child_face = verify_decision in {"child_face", "daughter_onnx"}
     title = (
         "Daughter confirmed by RV1106"
         if confirmed
@@ -535,6 +553,8 @@ async def save_ingested_clip(
         if confirmed
         else "RV1106 板端检测到持续稳定的儿童活动轨迹, 作为高召回候选由板端上传 4K 片段。"
     )
+    if verify_decision is not None:
+        summary += f" NAS安检通过({verify_decision})。"
     tags = ["daughter", "rv1106", identity, "board_high_ring"]
     category = f"rv1106_{identity}"
 
@@ -636,8 +656,8 @@ async def save_ingested_clip(
                 "confidence": min(1.0, max(0.0, score)),
                 "selection_score": selection_score,
                 "keep_consistency_repaired": False,
-                "local_child_confirmed": confirmed,
-                "local_child_score": score,
+                "local_child_confirmed": verified_child_face,
+                "local_child_score": child_evidence,
                 "source": "board_high_ring",
                 "source_stream_role": "board",
                 "source_started_at": display_clip_start.isoformat(timespec="seconds"),

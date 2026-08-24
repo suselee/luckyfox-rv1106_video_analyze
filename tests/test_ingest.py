@@ -585,6 +585,15 @@ def test_save_ingested_clip_verify_accepts_probable(tmp_path, monkeypatch):
     assert len(verifier.calls[0]) == 5  # 均匀抽 5 帧
     assert not job_dir.exists()
 
+    moment = database.get_moment(moment_id)
+    metadata = json.loads(Path(moment["metadata_path"]).read_text())
+    # Q4: 儿童证据回填 (child_face -> 1.0)
+    # selection = score*0.6 + activity*0.25 + evidence*0.15 = .45+.075+.15 = .675
+    assert abs(metadata["selection_score"] - 0.675) < 1e-6
+    assert metadata["local_child_confirmed"] is True
+    assert metadata["local_child_score"] == 1.0
+    assert "NAS安检通过" in metadata["summary"]
+
 
 def test_save_ingested_clip_verify_rejects_adult_probable(tmp_path, monkeypatch):
     settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
