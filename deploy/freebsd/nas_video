@@ -12,8 +12,8 @@ rcvar="nas_video_enable"
 load_rc_config "$name"
 
 : "${nas_video_enable:=NO}"
-: "${nas_video_user:=nasvideo}"
-: "${nas_video_chdir:=/usr/local/mine_nas_ai_video}"
+: "${nas_video_user:=root}"
+: "${nas_video_chdir:=/home/wonderful_moment/mine-nas-ai-video}"
 : "${nas_video_uv:=/usr/local/bin/uv}"
 : "${nas_video_run_args:=run nas-video}"
 
@@ -31,6 +31,8 @@ command="/usr/sbin/daemon"
 # is not "daemon", so stop/status would report "not running". -P
 # records the daemon supervisor pid, and daemon forwards SIGTERM to
 # the child and removes the pidfile on exit.
-command_args="-f -P ${pidfile} -u ${nas_video_user} /bin/sh -c 'export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_run_args}'"
+# -o keeps stdout/stderr (uv run output, [INGEST] verify lines) in a
+# log file instead of letting daemon(8) discard them.
+command_args="-f -o ${nas_video_logfile:-/mnt/var/nas-video.log} -P ${pidfile} -u ${nas_video_user} /bin/sh -c 'export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_run_args}'"
 
 run_rc_command "$1"
