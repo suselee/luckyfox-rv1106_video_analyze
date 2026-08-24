@@ -365,20 +365,33 @@ int main(int argc, char* argv[]) {
     if (!high_cfg.rtsp_url.empty() && !high_cfg.upload_url.empty()) {
         high_cfg.enabled = true;
         high = new HighStream(high_cfg);
-        if (high->start()) {
-            g_high = high;
-            printf("[INIT] high-stream enabled: ring=%zuMB upload=%s\n",
-                   high_cfg.ring_mb, high_cfg.upload_url.c_str());
+        g_high = high;
+        if (schedule_active_at(now_seconds(), schedule)) {
+            if (high->start()) {
+                printf("[INIT] high-stream enabled: ring=%zuMB upload=%s\n",
+                       high_cfg.ring_mb, high_cfg.upload_url.c_str());
+            } else {
+                delete high;
+                high = NULL;
+                g_high = NULL;
+                printf("[WARN] high-stream failed to start; MQTT-only mode\n");
+            }
         } else {
-            delete high;
-            high = NULL;
-            printf("[WARN] high-stream failed to start; MQTT-only mode\n");
+            // 窗口外懒启动: 不创建 feed 线程、不 open FIFO,
+            // ffmpeg-high 阻塞在输出 open 上 (无 RTSP 重连风暴)。
+            printf("[INIT] high-stream deferred (window closed)\n");
         }
     }
 
     H264Source src;
     MppDecoder decoder(rtsp_w, rtsp_h);
     bool stream_active = false;
+    // stdin 模式下 fd0 由 shell 重定向持有, open_stdin 只做字段采纳;
+    // 全进程仅采纳一次, 之后任何路径都不得 close(fd0), 否则写端 SIGPIPE。
+    bool src_adopted = false;
+    // 看门狗: 窗口内超过该秒数没有任何码流数据 -> 主动退出交给 supervisor 重建
+    double last_stream_data = -1e9;
+    const double STREAM_STALL_EXIT_SECONDS = 120.0;
 
     SystemMonitor monitor;
     monitor.sample();
@@ -446,23 +459,18 @@ int main(int argc, char* argv[]) {
                     mqtt, hit_topic, mqtt_qos, camera_id, sequence, ending,
                     rtsp_w, rtsp_h,
                     fusion_enabled ? "rockiva_fusion_v1" : "face_only");
-                if (stream_active) {
-                    src.close();
-                    decoder.deinit();
-                }
+                // stdin 模式绝不 src.close(): fd0 是 FIFO 读端, 关闭会让
+                // ffmpeg-low 写端 SIGPIPE 死亡并触发整条管线重启循环。
+                // 只释放 NPU 解码器省功耗; 码流留在管道里形成背压暂停。
+                decoder.deinit();
                 stream_active = false;
-                if (g_high) {
-                    g_high->stop();
-                    printf("[SCHEDULE] high-stream stopped\n");
-                }
                 reconnect_wait = 2;
                 last_health = -1e9;
-                printf("[SCHEDULE] active window ended; RTSP and decoder stopped\n");
-            } else if (g_high && g_high->running()) {
-                // 窗口外启动 (初始 stream_active=false) 也要停掉 4K 链路,
-                // 避免窗口外反复重连摄像头刷日志。
-                g_high->stop();
-                printf("[SCHEDULE] high-stream stopped (window closed)\n");
+                printf("[SCHEDULE] active window ended; decoder stopped (streams paused)\n");
+            }
+            if (g_high && g_high->running() && !g_high->paused()) {
+                g_high->pause();
+                printf("[SCHEDULE] high-stream paused\n");
             }
             if (loop_now - last_health >= 60.0) {
                 last_health = loop_now;
@@ -503,9 +511,20 @@ int main(int argc, char* argv[]) {
             // 握手特征仍被配额)。stdin 模式: 由外部 ffprobe 拉流, 摄像头
             // 对 ffprobe 无配额, 女儿_watch 从管道读 Annex-B。
             if (rtsp_stdin_mode) {
-                if (!src.open_stdin() || !decoder.init()) {
+                if (!src_adopted) {
+                    if (!src.open_stdin()) {
+                        reconnects++;
+                        printf("[WARN] stdin adopt failed; retry in %ds\n",
+                               reconnect_wait);
+                        sleep(reconnect_wait);
+                        reconnect_wait = std::min(30, reconnect_wait * 2);
+                        continue;
+                    }
+                    src_adopted = true;
+                }
+                if (!decoder.init()) {
                     reconnects++;
-                    printf("[WARN] stdin/decoder init failed; retry in %ds\n",
+                    printf("[WARN] decoder init failed; retry in %ds\n",
                            reconnect_wait);
                     sleep(reconnect_wait);
                     reconnect_wait = std::min(30, reconnect_wait * 2);
@@ -517,6 +536,7 @@ int main(int argc, char* argv[]) {
                 session_feeds = 0;
                 session_idrs = 0;
                 last_scan = -1e9;
+                last_stream_data = now_seconds();
                 printf("[SCHEDULE] stdin stream ready (ffprobe pipe)\n");
             } else if (!src.open(rtsp_url, true) || !decoder.init()) {
                 reconnects++;
@@ -530,8 +550,13 @@ int main(int argc, char* argv[]) {
             }
             stream_active = true;
             if (g_high) {
-                if (!g_high->running()) g_high->start();
-                printf("[SCHEDULE] high-stream (re)started\n");
+                if (!g_high->running()) {
+                    g_high->start();
+                    printf("[SCHEDULE] high-stream started\n");
+                } else if (g_high->paused()) {
+                    g_high->resume();
+                    printf("[SCHEDULE] high-stream resumed\n");
+                }
             }
             reconnect_wait = 2;
             session_frames_baseline = decoded_frames;
@@ -543,7 +568,17 @@ int main(int argc, char* argv[]) {
             printf("[SCHEDULE] active window started; RTSP and decoder running\n");
         }
 
+        // 看门狗: 窗口内长时间没有任何码流数据 (摄像头断电/半死流) 时
+        // 主动退出, 交给 supervisor 按退避策略重建, 避免静默假活。
+        if (stream_active && last_stream_data > 0 &&
+            now_seconds() - last_stream_data > STREAM_STALL_EXIT_SECONDS) {
+            printf("[DIAG] no stream data for %.0fs; exiting for supervisor restart\n",
+                   now_seconds() - last_stream_data);
+            break;
+        }
+
         int n = src.read_chunk(chunk.data(), (int)chunk.size());
+        if (n > 0 || n == -3) last_stream_data = now_seconds();
         if (n == -2) {
             // EOF: 摄像头主动断开。
             // 本会话拿到过帧 → 快速重连 (5s) 保持数据连续;
@@ -551,10 +586,8 @@ int main(int argc, char* argv[]) {
             // 触发摄像头侧惩罚 (曾实测连接周期被压到 2-3s)。
             if (!g_running) break;
             reconnects++;
-            if (now_seconds() - last_diag_log_ > 30.0) {
-                last_diag_log_ = now_seconds();
-            }
-            src.close();
+            // stdin 模式不 close(fd0): 写端死亡时保持读端, 靠退避重读
+            if (!rtsp_stdin_mode) src.close();
             decoder.deinit();
             stream_active = false;
             idle_chunk_reads = 0;
@@ -581,7 +614,7 @@ int main(int argc, char* argv[]) {
         if (n < 0) {
             if (!g_running) break;
             reconnects++;
-            src.close();
+            if (!rtsp_stdin_mode) src.close();
             decoder.deinit();
             stream_active = false;
             idle_chunk_reads = 0;
@@ -602,7 +635,7 @@ int main(int argc, char* argv[]) {
                     printf("[DIAG] STALL: %d x 3s poll timeout, no data; reconnect\n",
                            idle_chunk_reads);
                 }
-                src.close();
+                if (!rtsp_stdin_mode) src.close();
                 decoder.deinit();
                 stream_active = false;
                 idle_chunk_reads = 0;

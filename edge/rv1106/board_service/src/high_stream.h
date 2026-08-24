@@ -1,5 +1,6 @@
 #pragma once
 #include <pthread.h>
+#include <atomic>
 #include <stdint.h>
 #include <deque>
 #include <string>
@@ -66,6 +67,13 @@ public:
 
     bool running() const { return running_; }
 
+    // 窗口外暂停: 保持线程与 FIFO fd 存活, 仅停止读取。
+    // 管道背压让 ffmpeg-high 写端自然阻塞休眠 (不会 SIGPIPE 死亡);
+    // resume() 后从暂停点继续, 无需重连/重新握手。
+    void pause();
+    void resume();
+    bool paused() const { return paused_; }
+
 private:
     struct PendingClip {
         std::vector<uint8_t> data;
@@ -99,6 +107,7 @@ private:
     pthread_t feed_th_ = 0;
     pthread_t upload_th_ = 0;
     volatile bool running_ = false;
+    std::atomic<bool> paused_{false};
 
     pthread_mutex_t ev_mu_ = PTHREAD_MUTEX_INITIALIZER;
     std::vector<FusionEvent> ev_queue_;

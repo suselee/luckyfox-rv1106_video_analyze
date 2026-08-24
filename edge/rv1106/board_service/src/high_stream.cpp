@@ -45,6 +45,7 @@ bool HighStream::start() {
 void HighStream::stop() {
     if (!running_) return;
     running_ = false;
+    paused_ = false;
     // 唤醒上传线程
     pthread_mutex_lock(&up_mu_);
     pthread_cond_broadcast(&up_cond_);
@@ -53,6 +54,14 @@ void HighStream::stop() {
     if (upload_th_) pthread_join(upload_th_, NULL);
     feed_th_ = 0;
     upload_th_ = 0;
+}
+
+void HighStream::pause() {
+    paused_ = true;
+}
+
+void HighStream::resume() {
+    paused_ = false;
 }
 
 // ---- 事件入队 ---------------------------------------------------------------
@@ -91,6 +100,12 @@ void HighStream::feed_loop() {
      while (running_) {
         // 处理队列里的融合事件 (切片/上传)
         drain_events();
+
+        // 窗口外暂停: 不读流 (背压阻塞 ffmpeg-high), 保持 fd 与连接存活。
+        if (paused_) {
+            usleep(200 * 1000);
+            continue;
+        }
 
         // FIFO 音频 (ADTS): 每次循环排空, 时间戳用到达时间 (实时流)。
         if (audio_pipe_fd_ >= 0) {
@@ -230,6 +245,7 @@ void HighStream::drain_events() {
 }
 
 void HighStream::make_clip(const FusionEvent& ev) {
+    if (paused_) return;  // 窗口外不切片 (双保险: 主循环窗口外本就不产事件)
     bool do_cut = ev.event == "end" &&
                   (ev.identity == "confirmed" ||
                    (cfg_.upload_probable && ev.identity == "probable"));
