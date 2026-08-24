@@ -328,27 +328,39 @@ def _normalized_board_roi(
     width_scale: float,
     height_scale: float,
 ) -> tuple[float, float, float, float] | None:
-    """把板端像素 best_box 映射为裁剪用的归一化扩展 ROI (与 workers 同构)。"""
+    """把板端人物框映射为裁剪用的归一化扩展 ROI。
+
+    兼容两种输入: HTTP 上传 meta 的 best_box 为归一化值 (0~1);
+    MQTT 会话 payload 为像素值 (配 frame_width/frame_height)。
+    """
     raw_box = meta.get("best_box") or meta.get("box")
     if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
         return None
     try:
-        x, y, width, height = (float(value) for value in raw_box)
-        frame_width = float(meta.get("frame_width") or 640)
-        frame_height = float(meta.get("frame_height") or 360)
+        raw = [float(value) for value in raw_box]
     except (TypeError, ValueError):
         return None
-    if frame_width <= 0 or frame_height <= 0 or width <= 0 or height <= 0:
+    if any(value <= 0 for value in raw):
+        return None
+    if max(raw[0], raw[2]) > 1.5 or max(raw[1], raw[3]) > 1.5:
+        # 像素盒: 归一化需要帧宽高
+        frame_width = float(meta.get("frame_width") or 0)
+        frame_height = float(meta.get("frame_height") or 0)
+        if frame_width <= 0 or frame_height <= 0:
+            return None
+        x = raw[0] / frame_width
+        y = raw[1] / frame_height
+        width = raw[2] / frame_width
+        height = raw[3] / frame_height
+    else:
+        x, y, width, height = raw
+    if width <= 0 or height <= 0:
         return None
 
-    left = x / frame_width
-    top = y / frame_height
-    box_width = width / frame_width
-    box_height = height / frame_height
-    center_x = left + box_width / 2
-    center_y = top + box_height / 2
-    expanded_width = min(1.0, box_width * max(1.0, width_scale))
-    expanded_height = min(1.0, box_height * max(1.0, height_scale))
+    center_x = x + width / 2
+    center_y = y + height / 2
+    expanded_width = min(1.0, width * max(1.0, width_scale))
+    expanded_height = min(1.0, height * max(1.0, height_scale))
     roi_left = max(0.0, center_x - expanded_width / 2)
     roi_top = max(0.0, center_y - expanded_height / 2)
     roi_right = min(1.0, center_x + expanded_width / 2)
@@ -366,10 +378,11 @@ async def _verify_probable_clip(
 ) -> tuple[bool, str]:
     """对板端上传切片自身抽帧校验是否含儿童证据。
 
-    从切片时长内均匀取 5 帧, 按轨迹 ROI 裁剪后交给 DaughterDetector
-    的 verify_board_probable_paths: 儿童人脸/ONNX 证据接受; 连续成人脸
-    或无人在场拒绝; 无脸但人物稳定且板端分数强则按高召回放行。
-    返回 (accepted, decision)。
+    上传物是裸 Annex-B 基本流 (无容器时间戳), ffmpeg -ss 输入侧寻址
+    对其无效 —— 先零拷贝重封装为 MP4 (c:v copy, 容器级操作) 再按轨迹
+    ROI 均匀抽 5 帧, 交给 DaughterDetector.verify_board_probable_paths:
+    儿童人脸/ONNX 证据接受; 连续成人脸或无人在场拒绝; 无脸但人物稳定
+    且板端分数强则按高召回放行。返回 (accepted, decision)。
     """
     roi = _normalized_board_roi(
         meta,
@@ -383,14 +396,22 @@ async def _verify_probable_clip(
     duration = max(0.0, clip_end - clip_start)
     if duration <= 0:
         return True, "invalid_duration_fallback"
-    offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
     with tempfile.TemporaryDirectory(prefix="nas-video-clip-verify-") as temp_dir:
+        mp4_path = Path(temp_dir) / "clip.mp4"
+        try:
+            await remux_elementary_stream(settings, video_path, mp4_path)
+        except Exception as exc:
+            print(f"[INGEST] verify remux failed: {exc}", flush=True)
+            return True, "remux_failed_fallback"
+        if not mp4_path.exists() or mp4_path.stat().st_size == 0:
+            return True, "empty_remux_fallback"
+        offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
         frames = []
         for index, offset in enumerate(offsets, start=1):
             frame_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
             await extract_cropped_frame(
                 settings,
-                video_path,
+                mp4_path,
                 frame_path,
                 offset,
                 roi=roi,

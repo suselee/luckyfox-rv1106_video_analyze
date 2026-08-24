@@ -596,9 +596,13 @@ def test_save_ingested_clip_verify_rejects_adult_probable(tmp_path, monkeypatch)
     spool = IngestSpool(settings)
     job_dir = spool.spool(_probable_meta(), VIDEO_BYTES)
 
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+
     async def fake_extract(settings_, video_path_, output_path, offset, *, roi, output_width):
         output_path.write_bytes(b"jpg")
 
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
     monkeypatch.setattr(ingest_module, "extract_cropped_frame", fake_extract)
 
     verifier = _FakeVerifier(accepted=False, decision="adult_face")
