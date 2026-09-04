@@ -18,6 +18,8 @@ static FusionConfig test_config() {
     config.probable_hold_seconds = 3;
     config.confirm_child_hold_seconds = 60;
     config.mqtt_update_seconds = 5;
+    config.probable_min_activity = 0.0f;  // 测试关闭活动量门槛
+    config.adult_tall_observations = 2;
     config.face_threshold = 0.35f;
     config.face_high_threshold = 0.55f;
     return config;
@@ -177,6 +179,70 @@ int main() {
     events = fusion.collect_events(9);
     assert(events.size() == 1 && events[0].event == "end");
     assert(events[0].identity == "confirmed");
+
+    // 8/24 误报回归: 成人走入画面 (站立身高连续可见) 后坐下翻找。
+    // 坐下瞬间身高跌破 child_max 而活动量尚未衰减, 旧逻辑会单帧锁存
+    // probable 并保存纯成人片段 (face_score=0)。adult_prior 否决后
+    // 不得升级、不得开会话。
+    TrackFusion sitdown(config);
+    sitdown.observe(0, one_person(1, 0.10f, 0.80f));  // 站立: tall_streak=1
+    sitdown.observe(1, one_person(1, 0.10f, 0.80f));  // 站立: streak=2 -> 成人先验
+    sitdown.observe(2, one_person(1, 0.14f, 0.35f));  // 坐下: child_like, 活动中
+    sitdown.observe(3, one_person(1, 0.22f, 0.35f));
+    sitdown.observe(4, one_person(1, 0.30f, 0.35f));
+    sitdown.observe(5, one_person(1, 0.38f, 0.35f));  // age=5>=4, obs=6>=3
+    assert(sitdown.collect_events(5).empty());
+    assert(sitdown.probable_tracks() == 0);
+    // 先验粘滞: 持续活动也保持 UNKNOWN。
+    sitdown.observe(7, one_person(1, 0.46f, 0.35f));
+    sitdown.observe(9, one_person(1, 0.54f, 0.35f));
+    assert(sitdown.collect_events(9).empty());
+    assert(sitdown.probable_tracks() == 0);
+    // 强人脸确认 (>= high_threshold) 穿透成人先验。
+    sitdown.apply_face_score(1, 0.60f, 10);
+    sitdown.observe(10, one_person(1, 0.54f, 0.35f));
+    events = sitdown.collect_events(11);
+    assert(events.size() == 1 && events[0].identity == "confirmed");
+
+    // wobble 保活回归: probable 会话在 child_like 短暂丢失 (儿童站起/
+    // 被抱高) 的 probable_hold_seconds 内不得掉级断会话。
+    TrackFusion wobblerecover(config);
+    wobblerecover.observe(0, one_person(1, 0.1f, 0.35f));
+    wobblerecover.observe(1, one_person(1, 0.11f, 0.35f));
+    wobblerecover.observe(2, one_person(1, 0.12f, 0.35f));
+    wobblerecover.observe(4, one_person(1, 0.13f, 0.35f));
+    events = wobblerecover.collect_events(4);
+    assert(events.size() == 1 && events[0].event == "start");
+    assert(events[0].identity == "probable");
+    wobblerecover.observe(5, one_person(1, 0.13f, 0.70f));   // 抖动帧 (身高超阈)
+    assert(wobblerecover.collect_events(5).empty());          // 会话保持
+    wobblerecover.observe(6, one_person(1, 0.13f, 0.35f));   // 回到儿童体型
+    wobblerecover.observe(7, one_person(1, 0.13f, 0.35f));
+    events = wobblerecover.collect_events(8);
+    for (size_t i = 0; i < events.size(); ++i)
+        assert(events[i].event != "end");                     // 未断会话
+
+    // Q1/Q2 数据回归: 峰值时刻锁定活动最高的观测, 最后活跃时刻随活跃
+    // 观测刷新且静止后不再前进。
+    FusionConfig acfg = test_config();
+    acfg.probable_min_activity = 0.30f;
+    TrackFusion act(acfg);
+    // 静止 -> 大幅移动 3 帧 (EMA 升至峰) -> 静止 2 帧 (先仍活跃后衰减)
+    act.observe(0, one_person(1, 0.10f, 0.35f));   // 新轨迹 act=0
+    act.observe(1, one_person(1, 0.40f, 0.35f));   // act≈0.20
+    act.observe(2, one_person(1, 0.70f, 0.35f));   // act≈0.36 活跃
+    act.observe(3, one_person(1, 0.55f, 0.35f));   // act≈0.49 <- 峰值
+    act.observe(4, one_person(1, 0.56f, 0.35f));   // act≈0.41 活跃
+    act.observe(5, one_person(1, 0.57f, 0.35f));   // act≈0.34 活跃
+    events = act.collect_events(5.5);              // 打开会话
+    assert(events.size() == 1 && events[0].event == "start");
+    act.observe(6, one_person(1, 0.57f, 0.35f));   // act≈0.29 静止衰减
+    events = act.collect_events(9);
+    assert(events.size() == 1 && events[0].event == "end");
+    double peak_ts = events[0].activity_peak_ts;
+    double last_active = events[0].last_active_ts;
+    assert(peak_ts == 3.0);                        // 锁定 EMA 最高帧
+    assert(last_active == 5.0);                    // t=6 已跌破阈值不刷新
 
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;
