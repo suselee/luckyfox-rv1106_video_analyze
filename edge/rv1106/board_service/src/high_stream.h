@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "audio_ring.h"
+#include "time_util.h"
 #include "track_fusion.h"  // FusionEvent
 #include "video_ring.h"
 
@@ -69,6 +70,17 @@ public:
 
     bool running() const { return running_; }
 
+    // feed 看门狗 (主线程 HEALTH 中检查): feed 线程每收到视频块刷新一次。
+    // 运行 + 未暂停态下超限无数据 → 主循环退出重建整条管线。
+    // (volatile double 跨线程读写: 对齐访问下撕裂读仅造成单次误判/漏判,
+    // HEALTH 每 60s 复核, 无需加锁; 与 VideoRing 在 status_json 中的既有用法一致。)
+    void note_chunk() { last_chunk_ts_ = now_seconds(); }
+    double seconds_since_data(double now) const { return now - last_chunk_ts_; }
+    bool feed_stalled(double now, double limit) const {
+        return running_ && !paused_.load() &&
+               last_chunk_ts_ > 0 && (now - last_chunk_ts_) > limit;
+    }
+
     // 窗口外暂停: 保持线程与 FIFO fd 存活, 仅停止读取。
     // 管道背压让 ffmpeg-high 写端自然阻塞休眠 (不会 SIGPIPE 死亡);
     // resume() 后从暂停点继续, 无需重连/重新握手。
@@ -120,6 +132,7 @@ private:
 
     UploadStats stats_;
     double last_cut_ts_ = 0.0;   // 上次成功切片时间 (全局冷却, feed 线程独占)
+    volatile double last_chunk_ts_ = -1e9;  // 最近收到视频块时刻 (feed 写, 主读)
 };
 
 } // namespace dw

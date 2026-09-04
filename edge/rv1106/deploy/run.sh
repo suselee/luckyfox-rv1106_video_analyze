@@ -4,7 +4,9 @@ APP_DIR=/root/daughter_watch
 BIN="$APP_DIR/daughter_watch"
 CONFIG="$APP_DIR/config.ini"
 LOG=/tmp/daughter_watch.log
-MAX_LOG_BYTES=5242880
+MAX_LOG_BYTES=10485760
+# 日志保留两轮 (~2-3 天, /tmp 为 tmpfs 不伤闪存):
+# 断线类故障的取证高度依赖完整日志, 5MB 单轮只保 ~1 天曾导致现场丢失。
 MIN_VALID_YEAR=2025
 TIME_SYNC_RETRY_SECONDS=5
 FFMPEG=/root/ffmpeg
@@ -75,12 +77,51 @@ monitor_pipeline() {
         if ! kill -0 "$child" 2>/dev/null; then
             return 0
         fi
+        # 数据活度 (兜底): 三进程全活但无数据是曾经的永久假活形态。
+        # /tmp/dw_data 由 daughter_watch 窗口内每次 HEALTH(60s)刷新,
+        # 内容为最后收到码流的时刻; 窗口外 sleeping 不写, 故只在窗口内检查。
+        if data_stale; then
+            echo "[supervisor] no stream data for 10+ min (all processes alive); restarting pipeline" >>"$LOG"
+            [ -n "$child" ] && kill "$child" 2>/dev/null
+            return 0
+        fi
     done
+}
+
+data_stale() {
+    # 窗口 07:00-21:00 UTC+8 对应 23:00-13:00 UTC。
+    h=$(date -u +%H 2>/dev/null)
+    m=$(date -u +%M 2>/dev/null)
+    case "$h" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # 去掉前导 0, 避免 sh 八进制解释 (如 08/09)。
+    h=${h#0}; m=${m#0}
+    [ -z "$h" ] && h=0; [ -z "$m" ] && m=0
+    in_window=0
+    if [ "$h" -ge 23 ] || [ "$h" -lt 13 ]; then in_window=1; fi
+    # 窗口开始后 15 分钟宽限 (冷启动/相机恢复/退避需要时间)。
+    if [ "$h" -eq 23 ] && [ "$m" -lt 15 ]; then in_window=0; fi
+    if [ "$in_window" -eq 0 ]; then return 1; fi
+    if [ -f /tmp/dw_data ]; then
+        # 心跳超 10 分钟没刷新 → 主循环已无数据 (C++ 内 240s 熔断应先触发,
+        # 这里是它失效/卡死在 HEALTH 之外的最后一道防线)。
+        if find /tmp/dw_data -mmin +10 2>/dev/null | grep -q .; then
+            return 0
+        fi
+    else
+        # 进程起来超过 15 分钟还没有心跳文件 → 主循环根本没转起来。
+        if [ -n "$child" ] && find "/proc/$child" -mmin +15 2>/dev/null | grep -q .; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 fail_count=0
 while true; do
     if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$MAX_LOG_BYTES" ]; then
+        mv -f "$LOG.1" "$LOG.2" 2>/dev/null
         mv -f "$LOG" "$LOG.1"
     fi
     RTSP_URL=$(cfg_val "$CONFIG" rtsp url)
@@ -95,12 +136,19 @@ while true; do
     mkfifo "$HIGH_AUDIO_FIFO" 2>/dev/null
     mkfifo "$STDIN_FIFO" 2>/dev/null
     # 4K + 音频: stream1 -> 双 FIFO。-loglevel warning -nostats 抑制进度刷屏。
-    "$FFMPEG" -loglevel warning -nostats -rtsp_transport tcp -i "$RTSP_HIGH_URL" \
+    # -timeout 10s: RTSP socket I/O 超时 (微秒, 建连/读卡死时退出,
+    # 由 supervisor 重建; 板端 ffmpeg-7.0.2-static 不支持 -reconnect*/-stimeout,
+    # 加了会直接 "Option not found" 退出 → 切勿加)。
+    # 注意绝不能加 -rw_timeout: 窗口外 daughter_watch 暂停读取、靠背压让
+    # ffmpeg 休眠, 输出超时会把这种正常休眠误杀成整夜重启循环。
+    "$FFMPEG" -loglevel warning -nostats -rtsp_transport tcp -timeout 10000000 \
+        -i "$RTSP_HIGH_URL" \
         -map 0:v -c:v copy -f hevc -bsf:v hevc_mp4toannexb -y "$HIGH_FIFO" \
         -map 0:a -c:a copy -f adts -y "$HIGH_AUDIO_FIFO" 2>>"$LOG" &
     high_pid=$!
     # 检测流: stream2 -> FIFO -> daughter_watch stdin
-    "$FFMPEG" -loglevel warning -nostats -rtsp_transport tcp -i "$RTSP_URL" \
+    "$FFMPEG" -loglevel warning -nostats -rtsp_transport tcp -timeout 10000000 \
+        -i "$RTSP_URL" \
         -map 0:v -c:v copy -f h264 -bsf:v h264_mp4toannexb - \
         2>>"$LOG" > "$STDIN_FIFO" &
     ff_stdin_pid=$!

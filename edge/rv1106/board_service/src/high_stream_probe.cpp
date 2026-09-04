@@ -19,11 +19,8 @@
 
 using namespace dw;
 
-static double now_seconds() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec / 1e6;
-}
+// (本地 now_seconds 已删除: 与 time_util.h 的 dw::now_seconds() 同源同义,
+// 两者并存 + using namespace 会导致 overloaded ambiguous 编译失败。)
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {

@@ -29,6 +29,8 @@ bool HighStream::start() {
     if (cfg_.rtsp_url.empty() || cfg_.upload_url.empty()) return false;
     ring_.resize(cfg_.ring_mb * 1024 * 1024);
     audio_ring_.resize(cfg_.audio_ring_mb * 1024 * 1024);
+    // 看门狗宽限: 从此刻起算, 首个 4K 块到达前不判饥饿。
+    last_chunk_ts_ = now_seconds();
     running_ = true;
     if (pthread_create(&feed_th_, NULL, feed_thread_fn, this) != 0) {
         running_ = false;
@@ -61,6 +63,9 @@ void HighStream::pause() {
 }
 
 void HighStream::resume() {
+    // 暂停期间 (窗口外可达 10h) 无数据是正常的: 恢复时重置心跳,
+    // 否则 resume 后立即误判饥饿。死流则按正常宽限重新计时。
+    last_chunk_ts_ = now_seconds();
     paused_ = false;
 }
 
@@ -96,6 +101,10 @@ void HighStream::feed_loop() {
      size_t session_chunks = 0;
      size_t session_baseline = 0;
      int audio_pipe_fd_ = -1;
+     // pipe 模式 (ffmpeg 输出到 FIFO): 读端必须全程持有 fd, 绝不关闭。
+     // 关闭读端会让 ffmpeg 写端收到 SIGPIPE 死亡 (与主循环 stdin 模式同理);
+     // stall/EOF 时只 sleep 等待, 同一个 fd 上 ffmpeg 恢复写入后自动续流。
+     const bool pipe_mode = !cfg_.pipe_path.empty();
 
      while (running_) {
         // 处理队列里的融合事件 (切片/上传)
@@ -123,6 +132,12 @@ void HighStream::feed_loop() {
             if (!cfg_.pipe_path.empty()) {
                 ok = src.open_pipe(cfg_.pipe_path);
                 if (ok && !cfg_.audio_pipe_path.empty()) {
+                    // 先关旧 fd 再开新 fd, 避免每次重连泄漏一个 fd。
+                    // (正常持有路径下这里只执行一次。)
+                    if (audio_pipe_fd_ >= 0) {
+                        ::close(audio_pipe_fd_);
+                        audio_pipe_fd_ = -1;
+                    }
                     int afd = ::open(cfg_.audio_pipe_path.c_str(),
                                      O_RDONLY | O_NONBLOCK);
                     if (afd >= 0) {
@@ -173,7 +188,8 @@ void HighStream::feed_loop() {
         if (n == -2) {
             // EOF: 摄像头主动断开。有数据会话 → 5s 重连; 否则 30s 低频,
             // 避免高频新连接触发摄像头惩罚模式。
-            src.close();
+            // pipe 模式不 close: 保持 FIFO 读端持有, ffmpeg 恢复后自动续流。
+            if (!pipe_mode) src.close();
             idle_chunk_reads = 0;
             if (session_chunks > session_baseline) {
                 reconnect_wait = 2;
@@ -199,7 +215,8 @@ void HighStream::feed_loop() {
         }
         if (n < 0) {
             printf("[HIGH] stream error; closing\n");
-            src.close();
+            // pipe 模式不 close (同上, 防 SIGPIPE 杀死 ffmpeg 写端)。
+            if (!pipe_mode) src.close();
             reconnect_wait = 2;
             idle_chunk_reads = 0;
             continue;
@@ -208,8 +225,9 @@ void HighStream::feed_loop() {
             // 无数据 (3s poll 超时): 保活用单向 RTCP RR, 不发 GET_PARAMETER
             // (与 RTP 共用一个 TCP 连接, 读响应会吞数据破坏读流)。
             if (++idle_chunk_reads >= 3) {
-                // 9s 无数据才强制重连 (低频, 防摄像头配额)
-                src.close();
+                // 9s 无数据才强制重连 (低频, 防摄像头配额);
+                // pipe 模式只 sleep, 不 close (保持读端持有)。
+                if (!pipe_mode) src.close();
                 idle_chunk_reads = 0;
                 sleep(30);
             }
@@ -217,6 +235,7 @@ void HighStream::feed_loop() {
         }
         idle_chunk_reads = 0;
         if (n > 0) {
+            note_chunk();  // feed 看门狗心跳 (主线程 HEALTH 中检查)
             scanner.feed(chunk.data(), (size_t)n, now_seconds());
             session_chunks++;
         }
@@ -230,6 +249,10 @@ void HighStream::feed_loop() {
                 audio_chunks_++;
             }
         }
+    }
+    if (audio_pipe_fd_ >= 0) {
+        ::close(audio_pipe_fd_);
+        audio_pipe_fd_ = -1;
     }
     src.close();
     printf("[HIGH] feed thread stopped\n");

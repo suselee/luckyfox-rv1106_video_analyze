@@ -395,6 +395,16 @@ int main(int argc, char* argv[]) {
     // 看门狗: 窗口内超过该秒数没有任何码流数据 -> 主动退出交给 supervisor 重建
     double last_stream_data = -1e9;
     const double STREAM_STALL_EXIT_SECONDS = 120.0;
+    // 熔断退出: 累计无数据超过该秒数 -> 主动退出交给 supervisor 重建。
+    // ffmpeg 对 RTSP 没有自动重连 (连不上摄像头后进程活着刷错、不退出),
+    // stall 重建路径每次都会刷新解码器状态, 若同时重置 last_stream_data
+    // 会导致上面的 120s 看门狗永远不触发, 进程永久假活、永不恢复。
+    // 240s: 大于摄像头 30s 惩罚窗口 + ffmpeg 30s 重连退避, 避免误杀。
+    const double NO_DATA_EXIT_SECONDS = 240.0;
+    // 解码停滞重建: 有字节流但解不出帧 (VDEC wedged) 超过该秒数 → 重建解码器,
+    // 累计重建 2 次仍无帧 → 退出重建整条管线。
+    const double NODECODE_REBUILD_SECONDS = 180.0;
+    const int NODECODE_REBUILD_LIMIT = 2;
 
     SystemMonitor monitor;
     monitor.sample();
@@ -444,6 +454,10 @@ int main(int argc, char* argv[]) {
     double last_crop_dump = -1e9;
     double last_full_frame = -1e9;
     double last_feed_ts = -1e9;
+    double last_ffdbg_log = -1e9;   // FFDBG 空检日志节流 (原每秒一条, 撑爆日志)
+    double init_fail_since = -1e9;  // init 连续失败起始时刻 (熔断用)
+    double last_frame_ts = -1e9;    // 最近解出帧的时刻 (解码停滞看门狗)
+    int nodecode_rebuilds = 0;      // 无帧重建计数 (达限则退出)
     int reconnect_wait = 2;
 
     printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
@@ -519,6 +533,12 @@ int main(int argc, char* argv[]) {
                         reconnects++;
                         printf("[WARN] stdin adopt failed; retry in %ds\n",
                                reconnect_wait);
+                        if (init_fail_since < 0) init_fail_since = now_seconds();
+                        if (now_seconds() - init_fail_since > NO_DATA_EXIT_SECONDS) {
+                            printf("[DIAG] stream init failing for %.0fs; exiting for supervisor restart\n",
+                                   now_seconds() - init_fail_since);
+                            break;
+                        }
                         sleep(reconnect_wait);
                         reconnect_wait = std::min(30, reconnect_wait * 2);
                         continue;
@@ -529,6 +549,12 @@ int main(int argc, char* argv[]) {
                     reconnects++;
                     printf("[WARN] decoder init failed; retry in %ds\n",
                            reconnect_wait);
+                    if (init_fail_since < 0) init_fail_since = now_seconds();
+                    if (now_seconds() - init_fail_since > NO_DATA_EXIT_SECONDS) {
+                        printf("[DIAG] stream init failing for %.0fs; exiting for supervisor restart\n",
+                               now_seconds() - init_fail_since);
+                        break;
+                    }
                     sleep(reconnect_wait);
                     reconnect_wait = std::min(30, reconnect_wait * 2);
                     continue;
@@ -539,7 +565,10 @@ int main(int argc, char* argv[]) {
                 session_feeds = 0;
                 session_idrs = 0;
                 last_scan = -1e9;
-                last_stream_data = now_seconds();
+                // stdin 重建不得重置 last_stream_data: FIFO 写端 (ffmpeg) 未恢复前
+                // 这里每次 stall 都会经过, 重置会让无数据看门狗永远不触发。
+                // 只有从未收到过数据 (进程刚启动) 才初始化, 避免启动瞬间误触发熔断。
+                if (last_stream_data < -1e8) last_stream_data = now_seconds();
                 printf("[SCHEDULE] stdin stream ready (ffprobe pipe)\n");
             } else if (!src.open(rtsp_url, true) || !decoder.init()) {
                 reconnects++;
@@ -547,6 +576,12 @@ int main(int argc, char* argv[]) {
                 decoder.deinit();
                 printf("[WARN] RTSP or decoder initialization failed; retrying in %ds\n",
                        reconnect_wait);
+                if (init_fail_since < 0) init_fail_since = now_seconds();
+                if (now_seconds() - init_fail_since > NO_DATA_EXIT_SECONDS) {
+                    printf("[DIAG] stream init failing for %.0fs; exiting for supervisor restart\n",
+                           now_seconds() - init_fail_since);
+                    break;
+                }
                 sleep(reconnect_wait);
                 reconnect_wait = std::min(30, reconnect_wait * 2);
                 continue;
@@ -568,6 +603,10 @@ int main(int argc, char* argv[]) {
             last_scan = -1e9;
             last_face_fallback = -1e9;
             last_health = -1e9;
+            // 重建成功: 熔断计时清零; 解码看门狗给足宽限 (从此刻起算)。
+            init_fail_since = -1e9;
+            last_frame_ts = now_seconds();
+            nodecode_rebuilds = 0;
             printf("[SCHEDULE] active window started; RTSP and decoder running\n");
         }
 
@@ -594,6 +633,11 @@ int main(int argc, char* argv[]) {
             decoder.deinit();
             stream_active = false;
             idle_chunk_reads = 0;
+            if (now_seconds() - last_stream_data > NO_DATA_EXIT_SECONDS) {
+                printf("[DIAG] no stream data for %.0fs; exiting for supervisor restart\n",
+                       now_seconds() - last_stream_data);
+                break;
+            }
             if (decoded_frames > session_frames_baseline) {
                 reconnect_wait = 2;
                 sleep(5);
@@ -621,6 +665,11 @@ int main(int argc, char* argv[]) {
             decoder.deinit();
             stream_active = false;
             idle_chunk_reads = 0;
+            if (now_seconds() - last_stream_data > NO_DATA_EXIT_SECONDS) {
+                printf("[DIAG] no stream data for %.0fs; exiting for supervisor restart\n",
+                       now_seconds() - last_stream_data);
+                break;
+            }
             sleep(reconnect_wait);
             reconnect_wait = std::min(30, reconnect_wait * 2);
             continue;
@@ -642,12 +691,36 @@ int main(int argc, char* argv[]) {
                 decoder.deinit();
                 stream_active = false;
                 idle_chunk_reads = 0;
+                if (now_seconds() - last_stream_data > NO_DATA_EXIT_SECONDS) {
+                    printf("[DIAG] no stream data for %.0fs; exiting for supervisor restart\n",
+                           now_seconds() - last_stream_data);
+                    break;
+                }
                 sleep(30);
                 continue;
             }
             continue;
         }
         idle_chunk_reads = 0;
+        // 解码停滞: 字节在流但解不出帧 (VDEC wedged/垃圾码流) → 重建解码器;
+        // 注意字节看门狗此时不会触发 (last_stream_data 持续刷新), 必须独立判断。
+        if (last_frame_ts > 0 &&
+            now_seconds() - last_frame_ts > NODECODE_REBUILD_SECONDS) {
+            if (++nodecode_rebuilds > NODECODE_REBUILD_LIMIT) {
+                printf("[DIAG] no decoded frames for %.0fs after %d rebuilds; exiting for supervisor restart\n",
+                       now_seconds() - last_frame_ts, nodecode_rebuilds - 1);
+                decoder.deinit();
+                break;
+            }
+            printf("[DIAG] no decoded frames for %.0fs; rebuilding decoder (%d/%d)\n",
+                   now_seconds() - last_frame_ts,
+                   nodecode_rebuilds, NODECODE_REBUILD_LIMIT);
+            decoder.deinit();
+            stream_active = false;
+            idle_chunk_reads = 0;
+            sleep(5);
+            continue;
+        }
         if (n > 0) {
             int nal_type = h264_nal_type(chunk.data(), n);
             // keyframes_only: 关键帧必喂; 中间帧按 1s 节流抽样,
@@ -671,6 +744,8 @@ int main(int argc, char* argv[]) {
             if (!decoder.get_frame(frame, 0)) break;
             decoded_frames++;
             double now = now_seconds();
+            last_frame_ts = now;
+            nodecode_rebuilds = 0;
             int level = guard.level();
             double effective_fps = level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0);
             if (effective_fps <= 0) effective_fps = 0.5;
@@ -750,8 +825,12 @@ int main(int argc, char* argv[]) {
                     std::vector<FaceBox> all_faces = ff_detector.detect(
                         rgb.data(), frame.width(), frame.height(), det_score);
                     full_frame_detections += all_faces.size();
-                    if (all_faces.empty())
+                    // 空检日志节流 (原每秒一条, 占半数日志量导致轮转只保 ~1 天);
+                    // 有脸/识别失败等异常仍逐条保留。
+                    if (all_faces.empty() && now - last_ffdbg_log >= 30.0) {
+                        last_ffdbg_log = now;
                         printf("[FFDBG] t=%.1f no-face-in-full-frame\n", now);
+                    }
                     for (size_t fi = 0; fi < all_faces.size(); ++fi) {
                         const FaceBox& f = all_faces[fi];
                         int fw_px = (int)((f.x2 - f.x1) * frame.width());
@@ -1033,11 +1112,28 @@ int main(int argc, char* argv[]) {
                        "dec=%ld scan=%ld rkf=%llu fscan=%llu roi=%llu det=%llu elig=%llu emb=%llu sim=%llu maxsim=%.4f\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,
                        stats.temperature_c, p95, level,
-                       decoded_frames, scanned_frames, rockiva_face_detections,
-                       face_scan_attempts, roi_scans, retinaface_detections,
-                       eligible_face_detections, embedding_successes, similarity_samples,
-                       max_face_similarity);
+                        decoded_frames, scanned_frames, rockiva_face_detections,
+                        face_scan_attempts, roi_scans, retinaface_detections,
+                        eligible_face_detections, embedding_successes, similarity_samples,
+                        max_face_similarity);
                 detector_latencies.clear();
+                // 数据心跳 (supervisor 用): 窗口内每次 HEALTH 刷新最后收流时刻。
+                // 窗口外 sleeping 分支不写 —— supervisor 只在窗口内检查此文件。
+                {
+                    FILE* hf = fopen("/tmp/dw_data", "w");
+                    if (hf) {
+                        fprintf(hf, "%.0f\n", last_stream_data);
+                        fclose(hf);
+                    }
+                }
+                // 高流看门狗: 低流有帧但 4K 环超限无数据 → 整管线退出重建。
+                // (高流线程独立, 自身无退出路径; 运行+未暂停态才判。)
+                if (g_high && g_high->feed_stalled(now, NO_DATA_EXIT_SECONDS)) {
+                    printf("[DIAG] high-stream 4K ring starved %.0fs while low stream flows; exiting for supervisor restart\n",
+                           g_high->seconds_since_data(now));
+                    g_running = 0;
+                    break;
+                }
             }
         }
     }

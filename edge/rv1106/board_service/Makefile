@@ -48,7 +48,8 @@ MAIN_OBJ   = $(SRC)/main.o $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mqtt_publ
 ENROLL_OBJ = $(SRC)/enroll.o
 DECTEST_OBJ = $(SRC)/decode_test.o $(SRC)/mpp_decoder.o $(SRC)/stb_impl.o
 PROBE_OBJ = $(SRC)/rockiva_probe.o $(SRC)/rockiva_detector.o $(SRC)/system_monitor.o \
-            $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mpp_decoder.o
+            $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mpp_decoder.o \
+            $(SRC)/audio_util.o
 # 4K 主码流测参工具: 只依赖 h264_source (含 H265), 不连 MPP/RKNN
 HSPROBE_OBJ = $(SRC)/high_stream_probe.o $(SRC)/nal_stats.o $(SRC)/h264_source.o \
               $(SRC)/audio_util.o
