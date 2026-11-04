@@ -38,6 +38,19 @@ static IvaResult one_person(uint32_t id, float x, float height) {
     return result;
 }
 
+static IvaResult one_person_box(uint32_t id, float x, float y, float w, float h) {
+    IvaResult result;
+    IvaObject person = {};
+    person.id = id;
+    person.score = 0.9f;
+    person.x1 = x;
+    person.x2 = x + w;
+    person.y1 = y;
+    person.y2 = y + h;
+    result.people.push_back(person);
+    return result;
+}
+
 int main() {
     FusionConfig config = test_config();
     TrackFusion fusion(config);
@@ -243,6 +256,71 @@ int main() {
     double last_active = events[0].last_active_ts;
     assert(peak_ts == 3.0);                        // 锁定 EMA 最高帧
     assert(last_active == 5.0);                    // t=6 已跌破阈值不刷新
+
+    // 宽体否决回归 (a): 躺卧成人宽扁框 (w≈0.39 h≈0.28 aspect≈1.4)
+    // 连续 6+ 观测高活动量 -> 零事件, probable_tracks()==0;
+    // 再 apply_face_score(0.60) -> confirmed (强人脸穿透)。
+    {
+        FusionConfig wconfig = test_config();
+        wconfig.adult_wide_observations = 3;
+        wconfig.adult_wide_width_ratio = 0.30f;
+        wconfig.adult_wide_aspect = 1.0f;
+        wconfig.probable_min_activity = 0.0f;  // 活动量门槛关闭, 纯几何触发
+        TrackFusion wide(wconfig);
+        // 躺卧成人: x=0.1, y=0.3, w=0.39, h=0.28 (aspect≈1.39 > 1.0, width>0.30)
+        for (int i = 0; i < 6; ++i) {
+            wide.observe(i, one_person_box(1, 0.10f, 0.30f, 0.39f, 0.28f));
+        }
+        assert(wide.collect_events(6).empty());
+        assert(wide.probable_tracks() == 0);
+        // 持续活动也保持 UNKNOWN (先验粘滞)
+        wide.observe(7, one_person_box(1, 0.10f, 0.30f, 0.39f, 0.28f));
+        wide.observe(9, one_person_box(1, 0.10f, 0.30f, 0.39f, 0.28f));
+        assert(wide.collect_events(9).empty());
+        assert(wide.probable_tracks() == 0);
+        // 强人脸确认 (>= high_threshold) 穿透宽体先验
+        wide.apply_face_score(1, 0.60f, 10);
+        wide.observe(10, one_person_box(1, 0.10f, 0.30f, 0.39f, 0.28f));
+        events = wide.collect_events(11);
+        assert(events.size() == 1 && events[0].identity == "confirmed");
+    }
+
+    // 宽体否决回归 (b): 走动儿童窄框 (w 0.10-0.18, aspect ~0.35) -> probable 正常开启
+    {
+        FusionConfig wconfig = test_config();
+        wconfig.adult_wide_observations = 3;
+        wconfig.adult_wide_width_ratio = 0.30f;
+        wconfig.adult_wide_aspect = 1.0f;
+        wconfig.probable_min_activity = 0.0f;
+        TrackFusion child(wconfig);
+        // 走动儿童: 窄框, aspect 远小于 1.0
+        child.observe(0, one_person_box(1, 0.10f, 0.40f, 0.12f, 0.35f));
+        child.observe(1, one_person_box(1, 0.11f, 0.40f, 0.13f, 0.35f));
+        child.observe(2, one_person_box(1, 0.12f, 0.40f, 0.14f, 0.35f));
+        child.observe(4, one_person_box(1, 0.13f, 0.40f, 0.15f, 0.35f));
+        events = child.collect_events(4);
+        assert(events.size() == 1 && events[0].event == "start");
+        assert(events[0].identity == "probable");
+    }
+
+    // 宽体否决回归 (c): 直坐成人 (w≈0.15, h≈0.33, aspect≈0.45) -> 仍可 probable
+    // 记录已知残留: 直坐成人宽度未达宽体阈值, 无脸几何通道仍会升级。
+    {
+        FusionConfig wconfig = test_config();
+        wconfig.adult_wide_observations = 3;
+        wconfig.adult_wide_width_ratio = 0.30f;
+        wconfig.adult_wide_aspect = 1.0f;
+        wconfig.probable_min_activity = 0.0f;
+        TrackFusion sitting(wconfig);
+        // 直坐成人: 窄框, aspect < 1.0, 宽度 < 0.30
+        sitting.observe(0, one_person_box(1, 0.10f, 0.30f, 0.15f, 0.33f));
+        sitting.observe(1, one_person_box(1, 0.11f, 0.30f, 0.15f, 0.33f));
+        sitting.observe(2, one_person_box(1, 0.12f, 0.30f, 0.15f, 0.33f));
+        sitting.observe(4, one_person_box(1, 0.13f, 0.30f, 0.15f, 0.33f));
+        events = sitting.collect_events(4);
+        assert(events.size() == 1 && events[0].event == "start");
+        assert(events[0].identity == "probable");
+    }
 
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;

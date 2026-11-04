@@ -330,8 +330,12 @@ def _normalized_board_roi(
 ) -> tuple[float, float, float, float] | None:
     """把板端人物框映射为裁剪用的归一化扩展 ROI。
 
-    兼容两种输入: HTTP 上传 meta 的 best_box 为归一化值 (0~1);
+    板端 best_box / box 的归一化语义是 (x1, y1, x2, y2);
     MQTT 会话 payload 为像素值 (配 frame_width/frame_height)。
+
+    2026-11-04 修正: 旧实现把归一化框按 (x, y, w, h) 解释, 导致 74% 的
+    历史框"越界"(x+w > 1), ROI 中心向右下偏移且尺寸被放大 3~6 倍,
+    裁剪框经常框不到人, 表现为 no_person 大量误拒。
     """
     raw_box = meta.get("best_box") or meta.get("box")
     if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
@@ -340,25 +344,31 @@ def _normalized_board_roi(
         raw = [float(value) for value in raw_box]
     except (TypeError, ValueError):
         return None
-    if any(value <= 0 for value in raw):
-        return None
+
     if max(raw[0], raw[2]) > 1.5 or max(raw[1], raw[3]) > 1.5:
-        # 像素盒: 归一化需要帧宽高
+        # 像素坐标 (x1, y1, x2, y2): 归一化需要帧宽高
         frame_width = float(meta.get("frame_width") or 0)
         frame_height = float(meta.get("frame_height") or 0)
         if frame_width <= 0 or frame_height <= 0:
             return None
-        x = raw[0] / frame_width
-        y = raw[1] / frame_height
-        width = raw[2] / frame_width
-        height = raw[3] / frame_height
+        x1 = raw[0] / frame_width
+        y1 = raw[1] / frame_height
+        x2 = raw[2] / frame_width
+        y2 = raw[3] / frame_height
     else:
-        x, y, width, height = raw
-    if width <= 0 or height <= 0:
-        return None
+        # 归一化坐标, 板端语义为 (x1, y1, x2, y2)
+        x1, y1, x2, y2 = raw
 
-    center_x = x + width / 2
-    center_y = y + height / 2
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        # 兼容旧语义 (x, y, w, h)
+        x1, y1, width, height = raw
+        if width <= 0 or height <= 0:
+            return None
+
+    center_x = x1 + width / 2
+    center_y = y1 + height / 2
     expanded_width = min(1.0, width * max(1.0, width_scale))
     expanded_height = min(1.0, height * max(1.0, height_scale))
     roi_left = max(0.0, center_x - expanded_width / 2)
@@ -433,6 +443,44 @@ async def _verify_probable_clip(
                 settings.rv1106_verify_board_person_score
             ),
         )
+        if not verification.accepted:
+            # 2026-11-04: 板端新模型的 probable 检测框可能指向非人体区域
+            # (实测 box 落在右边缘白墙, ROI 裁剪 person_score 恒为 0),
+            # 此时 ROI 校验必然 no_person。回退整帧校验, 避免因板端框
+            # 不可靠而把真实在场景内的片段全部丢弃。
+            full_frames = []
+            for index, offset in enumerate(offsets, start=1):
+                frame_path = Path(temp_dir) / f"clip-full-{index}.jpg"
+                await extract_cropped_frame(
+                    settings,
+                    mp4_path,
+                    frame_path,
+                    offset,
+                    roi=(0.0, 0.0, 1.0, 1.0),
+                    output_width=settings.rv1106_verify_frame_width,
+                )
+                if frame_path.exists():
+                    full_frames.append(frame_path)
+            if full_frames:
+                fallback = detector.verify_board_probable_paths(
+                    full_frames,
+                    required_frames=2,
+                    required_person_frames=(
+                        settings.rv1106_verify_person_frames
+                    ),
+                    board_score=float(meta.get("score") or 0.0),
+                    board_person_score=float(meta.get("person_score") or 0.0),
+                    board_score_threshold=settings.rv1106_verify_board_score,
+                    board_person_score_threshold=(
+                        settings.rv1106_verify_board_person_score
+                    ),
+                )
+                if fallback.accepted:
+                    print(
+                        "[INGEST] verify roi-miss, accepted on full frame",
+                        flush=True,
+                    )
+                    verification = fallback
         return verification.accepted, verification.decision, verification
 
 

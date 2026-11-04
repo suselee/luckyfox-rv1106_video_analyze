@@ -80,11 +80,17 @@ int rknn_model_init(RknnModel* m, const char* path) {
     m->input_mems = (rknn_tensor_mem**)calloc(m->io_num.n_input, sizeof(rknn_tensor_mem*));
     m->input_attrs[0].type = RKNN_TENSOR_UINT8;
     m->input_attrs[0].fmt  = RKNN_TENSOR_NHWC;
-    m->input_mems[0] = rknn_create_mem(m->ctx, m->input_attrs[0].size_with_stride);
+    // 部分模型 (RV1106 上转换出的) size_with_stride 为 0, 回退到 size
+    size_t in_sz = m->input_attrs[0].size_with_stride ? m->input_attrs[0].size_with_stride
+                                                     : m->input_attrs[0].size;
+    m->input_mems[0] = rknn_create_mem(m->ctx, in_sz);
 
     m->output_mems = (rknn_tensor_mem**)calloc(m->io_num.n_output, sizeof(rknn_tensor_mem*));
-    for (uint32_t i = 0; i < m->io_num.n_output; i++)
-        m->output_mems[i] = rknn_create_mem(m->ctx, m->output_attrs[i].size_with_stride);
+    for (uint32_t i = 0; i < m->io_num.n_output; i++) {
+        size_t sz = m->output_attrs[i].size_with_stride ? m->output_attrs[i].size_with_stride
+                                                        : m->output_attrs[i].size;
+        m->output_mems[i] = rknn_create_mem(m->ctx, sz);
+    }
 
     ret = rknn_set_io_mem(m->ctx, m->input_mems[0], &m->input_attrs[0]);
     if (ret < 0) return -1;

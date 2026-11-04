@@ -1,5 +1,7 @@
 #include "mpp_decoder.h"
 
+#include <unistd.h>
+
 #include <stdio.h>
 #include <string.h>
 
@@ -157,18 +159,55 @@ bool Nv12Frame::copy_nv12(std::vector<uint8_t>& nv12) const {
     return true;
 }
 
+// 诊断: 存在 /root/yolo_dump_flag 时, 首帧把帧参数与原始平面落盘, 用于离线定位 stride/格式问题
+static void dump_frame_planes(const VIDEO_FRAME_S& f) {
+    static int dbg_count = 0;
+    if (dbg_count >= 1) return;
+    if (access("/root/yolo_dump_flag", F_OK) != 0) return;
+    FILE* mf = fopen("/root/frame_meta.txt", "w");
+    if (mf) {
+        fprintf(mf, "enPixelFormat=%d w=%u h=%u virW=%u virH=%u p0=%p p1=%p\n",
+                (int)f.enPixelFormat, f.u32Width, f.u32Height,
+                f.u32VirWidth, f.u32VirHeight,
+                (void*)f.pVirAddr[0], (void*)f.pVirAddr[1]);
+        fclose(mf);
+    }
+    int w = (int)f.u32Width, h = (int)f.u32Height;
+    int ys = f.u32VirWidth ? (int)f.u32VirWidth : w;
+    int vh = f.u32VirHeight ? (int)f.u32VirHeight : h;
+    if (f.pVirAddr[0]) {
+        FILE* yf = fopen("/root/plane_Y.bin", "wb");
+        if (yf) { fwrite(f.pVirAddr[0], 1, (size_t)ys * vh, yf); fclose(yf); }
+    }
+    {
+        const uint8_t* y0 = reinterpret_cast<const uint8_t*>(f.pVirAddr[0]);
+        const uint8_t* guess = y0 + (size_t)ys * vh;
+        const uint8_t* p1 = reinterpret_cast<const uint8_t*>(f.pVirAddr[1]);
+        const uint8_t* uvp = (p1 && p1 >= guess) ? p1 : guess;
+        FILE* uf = fopen("/root/plane_UV.bin", "wb");
+        if (uf) { fwrite(uvp, 1, (size_t)ys * vh / 2, uf); fclose(uf); }
+    }
+    printf("[MPP] dumped frame planes fmt=%d %ux%u vir=%ux%u\n",
+           (int)f.enPixelFormat, w, h, f.u32VirWidth, f.u32VirHeight);
+    dbg_count++;
+}
+
 bool Nv12Frame::to_rgb(std::vector<uint8_t>& rgb) const {
     if (!valid()) return false;
     const VIDEO_FRAME_S& f = frame_info(frame_info_)->stVFrame;
+    dump_frame_planes(f);
     int w = (int)f.u32Width;
     int h = (int)f.u32Height;
     int y_stride = f.u32VirWidth ? (int)f.u32VirWidth : w;
     int vir_h = f.u32VirHeight ? (int)f.u32VirHeight : h;
     if (f.enPixelFormat == RK_FMT_YUV420SP && f.pVirAddr[0]) {
         const uint8_t* y = reinterpret_cast<const uint8_t*>(f.pVirAddr[0]);
-        const uint8_t* uv = f.pVirAddr[1]
-            ? reinterpret_cast<const uint8_t*>(f.pVirAddr[1])
-            : y + (size_t)y_stride * vir_h;
+        // RockIt 的 VIDEO_FRAME_S 在 NV12 下常把 pVirAddr[1] 也填成 Y 平面首地址
+        // (实测 p0 == p1), 直接当 UV 用会把亮度当色度, 导致画面严重偏色/错位。
+        // 只有当 p1 确实落在 Y 平面之后时才采信, 否则按 Y 平面大小推算 UV 偏移。
+        const uint8_t* uv_guess = y + (size_t)y_stride * vir_h;
+        const uint8_t* p1 = reinterpret_cast<const uint8_t*>(f.pVirAddr[1]);
+        const uint8_t* uv = (p1 && p1 >= uv_guess) ? p1 : uv_guess;
         rgb.resize((size_t)w * h * 3);
         nv12_planar_to_rgb(y, uv, y_stride, w, h, rgb.data());
         return true;
@@ -178,9 +217,10 @@ bool Nv12Frame::to_rgb(std::vector<uint8_t>& rgb) const {
         const uint8_t* y = reinterpret_cast<const uint8_t*>(f.pVirAddr[0]);
         int uv_stride = (y_stride + 1) / 2;
         int uv_h = (vir_h + 1) / 2;
-        const uint8_t* first = f.pVirAddr[1]
-            ? reinterpret_cast<const uint8_t*>(f.pVirAddr[1])
-            : y + (size_t)y_stride * vir_h;
+        // 同上: pVirAddr[1] 可能是 Y 平面首地址, 需校验后再采信
+        const uint8_t* uv_guess = y + (size_t)y_stride * vir_h;
+        const uint8_t* p1 = reinterpret_cast<const uint8_t*>(f.pVirAddr[1]);
+        const uint8_t* first = (p1 && p1 >= uv_guess) ? p1 : uv_guess;
         const uint8_t* second = first + (size_t)uv_stride * uv_h;
         const uint8_t* u = f.enPixelFormat == RK_FMT_YUV420P ? first : second;
         const uint8_t* v = f.enPixelFormat == RK_FMT_YUV420P ? second : first;

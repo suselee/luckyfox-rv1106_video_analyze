@@ -44,8 +44,12 @@ MAIN_OBJ   = $(SRC)/main.o $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mqtt_publ
              $(SRC)/mpp_decoder.o $(SRC)/rockiva_detector.o $(SRC)/track_fusion.o \
              $(SRC)/system_monitor.o $(SRC)/schedule.o \
              $(SRC)/video_ring.o $(SRC)/http_uploader.o $(SRC)/high_stream.o $(SRC)/nal_stats.o \
-             $(SRC)/audio_ring.o $(SRC)/audio_util.o
+             $(SRC)/audio_ring.o $(SRC)/audio_util.o $(SRC)/yolo_detector.o
 ENROLL_OBJ = $(SRC)/enroll.o
+# 扩底库前的身份过滤工具: 对候选图打分, 只把确认是女儿的样本追加进底库
+FSCORE_OBJ = $(SRC)/face_score.o
+# 候选人体检测模型探针 (yolov5s/yolov8n rknn 的检出率与耗时评估)
+PPROBE_OBJ = $(SRC)/person_probe.o
 DECTEST_OBJ = $(SRC)/decode_test.o $(SRC)/mpp_decoder.o $(SRC)/stb_impl.o
 PROBE_OBJ = $(SRC)/rockiva_probe.o $(SRC)/rockiva_detector.o $(SRC)/system_monitor.o \
             $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mpp_decoder.o \
@@ -58,12 +62,20 @@ SCHEDULE_TEST_OBJ = $(SRC)/schedule_test.o $(SRC)/schedule.o
 
 .PHONY: all clean install
 
-all: daughter_watch enroll decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test
+all: daughter_watch enroll face_score person_probe decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test
 
 daughter_watch: $(COMMON_OBJ) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(RKNN_LDFLAGS) $(ROCKIT_LDFLAGS) $(ROCKIVA_LDFLAGS) $(COMMON_LDFLAGS)
 
 enroll: $(COMMON_OBJ) $(ENROLL_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(RKNN_LDFLAGS) $(COMMON_LDFLAGS)
+
+# 底库身份过滤: 对候选图输出与现有底库的相似度
+face_score: $(COMMON_OBJ) $(FSCORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(RKNN_LDFLAGS) $(COMMON_LDFLAGS)
+
+# 候选检测模型探针: 只依赖 rknn + stb
+person_probe: $(SRC)/person_probe.o $(SRC)/stb_impl.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(RKNN_LDFLAGS) $(COMMON_LDFLAGS)
 
 # 硬解验证工具: 只依赖 rockit + stb, 不需要 rknn
@@ -88,7 +100,7 @@ $(SRC)/%.o: $(SRC)/%.cpp
 
 install: all
 	@mkdir -p $(INSTALL_DIR)
-	cp daughter_watch enroll decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test $(INSTALL_DIR)/
+	cp daughter_watch enroll face_score decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test $(INSTALL_DIR)/
 	cp $(RKNN_API_LIB)/librknnmrt.so $(INSTALL_DIR)/
 	cp $(ROCKIT_LIB)/librockit_full.so $(INSTALL_DIR)/
 	cp $(ROCKIVA_LIB)/librockiva.so $(INSTALL_DIR)/
@@ -111,5 +123,5 @@ install: all
 	@echo "先验证硬解:  ./decode_test test.h264 out.jpg"
 
 clean:
-	rm -f $(SRC)/*.o daughter_watch enroll decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test
+	rm -f $(SRC)/*.o daughter_watch enroll face_score decode_test rockiva_probe high_stream_probe track_fusion_test schedule_test
 	rm -rf $(INSTALL_DIR)

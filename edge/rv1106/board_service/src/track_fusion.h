@@ -31,12 +31,24 @@ struct FusionConfig {
     // 该阈值才升 probable (0.0=关闭活动量要求)。区分"坐着的成人"与
     // "活动中/走动中的儿童"。
     float probable_min_activity;
-    // 成人先验否决: 同一轨迹连续 >= 该次数观测到身高超过
+    // 成人先验否决 (身高): 同一轨迹连续 >= 该次数观测到身高超过
     // child_max_height_ratio (站立/行走体态), 则判定为成人先验并粘滞,
     // 之后该轨迹不得再经无脸几何通道升级 probable (坐下后体型近似儿童,
     // 活动量瞬时达标即锁存是本次误报根因)。仅 >= face_high_threshold 的
     // 强人脸确认不受影响。0=禁用。
     int adult_tall_observations;
+    // 人体框最低置信度: 低于该值的检出直接丢弃, 连轨迹都不建。
+    // (YOLO INT8 下 <0.20 的多为椅子/窗帘/桌腿等误检, 一个坏框足以靠
+    //  track_lost_seconds 存活并触发 probable 事件。)
+    float person_min_score = 0.0f;   // 0=不过滤 (单测默认关闭)
+    // 成人先验否决 (宽体): 同一轨迹连续 >= 该次数观测到宽度超过
+    // adult_wide_width_ratio 且宽高比超过 adult_wide_aspect (躺卧/瘫坐体态),
+    // 则判定为成人先验并粘滞, 之后该轨迹不得再经无脸几何通道升级 probable。
+    // 躺在沙发上的成人宽扁框 (w≈0.39 h≈0.28 aspect≈1.4) 会触发此否决,
+    // 走动儿童窄框 (w 0.10-0.18, aspect ~0.35) 永不触发。0=禁用。
+    int adult_wide_observations;
+    float adult_wide_width_ratio;
+    float adult_wide_aspect;
     float face_threshold;
     float face_high_threshold;
 };
@@ -125,6 +137,8 @@ private:
         bool session_active;
         // 成人先验状态: 连续 tall_streak 次身高超阈值后 adult_prior 粘滞。
         int tall_streak;
+        // 成人先验状态 (宽体): 连续 wide_streak 次宽体超阈值后 adult_prior 粘滞。
+        int wide_streak;
         bool adult_prior;
         // 精彩度选峰: 活动 EMA 峰值与最后活跃时刻 (Q1/Q2)。
         float activity_peak;

@@ -31,6 +31,9 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
     std::vector<uint32_t> matched_ids;
     for (size_t i = 0; i < detections.people.size(); ++i) {
         const IvaObject& person = detections.people[i];
+        // 低置信度检出直接忽略: 不建轨迹、不刷新已有轨迹
+        if (config_.person_min_score > 0 && person.score < config_.person_min_score)
+            continue;
         Track* selected = NULL;
         float best_match = -1e9f;
         for (std::map<uint32_t, Track>::iterator candidate = tracks_.begin();
@@ -77,6 +80,7 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.previous_cy = (person.y1 + person.y2) * 0.5f;
             track.observations = 1;
             track.tall_streak = 0;
+            track.wide_streak = 0;
             track.adult_prior = false;
             track.last_probable_evidence = -1e9;
             track.identity = IDENTITY_UNKNOWN;
@@ -108,7 +112,8 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         Track& track = *selected;
         matched_ids.push_back(track.id);
         float height = person.y2 - person.y1;
-        // 成人先验: 站立/行走体态连续可见即粘滞标记 (坐下的成人身高会
+        float width = person.x2 - person.x1;
+        // 成人先验 (身高): 站立/行走体态连续可见即粘滞标记 (坐下的成人身高会
         // 跌破 child_max_height_ratio, 与儿童体型无法区分, 必须靠"曾站
         // 立"这一历史证据否决无脸几何通道)。
         if (config_.adult_tall_observations > 0 &&
@@ -117,6 +122,17 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
                 track.adult_prior = true;
         } else {
             track.tall_streak = 0;
+        }
+        // 成人先验 (宽体): 躺卧/瘫坐体态连续可见即粘滞标记 (躺在沙发上的成人
+        // 宽扁框 w≈0.39 h≈0.28 aspect≈1.4 会触发此否决, 走动儿童窄框
+        // w 0.10-0.18 aspect ~0.35 永不触发)。height>0 防除零。
+        if (config_.adult_wide_observations > 0 && height > 0.0f &&
+            width > config_.adult_wide_width_ratio &&
+            width / height > config_.adult_wide_aspect) {
+            if (++track.wide_streak >= config_.adult_wide_observations)
+                track.adult_prior = true;
+        } else {
+            track.wide_streak = 0;
         }
         bool absolute_child = height >= 0.12f && height <= config_.child_max_height_ratio;
         bool relative_child = detections.people.size() > 1 && tallest > 0 &&

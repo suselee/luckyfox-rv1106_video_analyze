@@ -23,6 +23,7 @@
 #include "mpp_decoder.h"
 #include "mqtt_publisher.h"
 #include "rockiva_detector.h"
+#include "yolo_detector.h"
 #include "schedule.h"
 #include "system_monitor.h"
 #include "track_fusion.h"
@@ -311,6 +312,25 @@ int main(int argc, char* argv[]) {
     if (pipeline_mode == "fusion" && !fusion_enabled)
         printf("[WARN] RockIVA unavailable (error=%d); starting face-only fallback\n", iva.last_error());
 
+    // 人体检测器选择: rockiva (默认) | yolov5。
+    // 本机实测 RockIVA 在客厅逆光/远景下 person 召回仅 ~8%, YOLOv5 离线 65-96%。
+    // yolov5 模式下仍保留 RockIVA 只取人脸框 (人体框丢弃), 避免影响身份识别路径。
+    std::string person_detector = cfg.get("pipeline.person_detector", "rockiva");
+    YoloPersonDetector yolo;
+    bool yolo_enabled = false;
+    if (pipeline_mode == "fusion" && person_detector == "yolov5") {
+        yolo_enabled = yolo.init(
+            cfg.get("pipeline.yolo_model",
+                    "/root/daughter_watch/models/yolov5n_416.rknn").c_str(),
+            cfg.get_int("pipeline.yolo_input", 416),
+            (float)cfg.get_double("pipeline.yolo_conf", 0.15));
+        if (!yolo_enabled)
+            printf("[WARN] YOLOv5 detector unavailable; falling back to RockIVA people\n");
+        else
+            printf("[DETECT] person detector = yolov5 (%s)\n",
+                   cfg.get("pipeline.yolo_model", "yolov5n_416.rknn").c_str());
+    }
+
     FusionConfig fusion_cfg;
     fusion_cfg.probable_min_seconds = cfg.get_double("pipeline.probable_min_seconds", 10.0);
     fusion_cfg.probable_min_observations = cfg.get_int("pipeline.probable_min_observations", 8);
@@ -328,6 +348,14 @@ int main(int argc, char* argv[]) {
         "pipeline.probable_min_activity", 0.20);
     fusion_cfg.adult_tall_observations = cfg.get_int(
         "pipeline.adult_tall_observations", 3);
+    fusion_cfg.person_min_score = (float)cfg.get_double(
+        "pipeline.person_min_score", 0.25);
+    fusion_cfg.adult_wide_observations = cfg.get_int(
+        "pipeline.adult_wide_observations", 3);
+    fusion_cfg.adult_wide_width_ratio = (float)cfg.get_double(
+        "pipeline.adult_wide_width_ratio", 0.30);
+    fusion_cfg.adult_wide_aspect = (float)cfg.get_double(
+        "pipeline.adult_wide_aspect", 1.0);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
@@ -757,6 +785,53 @@ int main(int argc, char* argv[]) {
                 IvaResult objects;
                 double begin = now_seconds();
                 bool ok = false;
+                if (yolo_enabled) {
+                    // 人体框来自 YOLOv5; 人脸框仍取 RockIVA (若可用)
+                    if (frame.to_rgb(rgb)) {
+                        ok = yolo.detect(rgb.data(), frame.width(), frame.height(), objects);
+                    } else {
+                        ok = false;
+                    }
+                    if (fusion_enabled) {
+                        IvaResult iva_objects;
+                        if (frame.data_fd() >= 0) {
+                            iva.detect_fd(++iva_frame_id, frame.data_fd(),
+                                          frame.yuv420_layout(), frame.width(),
+                                          frame.height(), iva_objects);
+                        } else if (frame.physical_addr()) {
+                            iva.detect_physical(++iva_frame_id, frame.physical_addr(),
+                                                frame.yuv420_layout(),
+                                                frame.width(), frame.height(), iva_objects);
+                        } else if (frame.copy_nv12(compact_nv12)) {
+                            iva.detect_nv12(++iva_frame_id, compact_nv12.data(),
+                                            frame.width(), frame.height(), iva_objects);
+                        }
+                        objects.faces = iva_objects.faces;
+                        // 分数校准: YOLO 的 INT8 置信度偏低 (~0.1-0.3), 而 NAS 侧
+                        // faceless_person 校验要求 board_person_score >= 0.70。
+                        // RockIVA 的 person 分数标定更接近真实置信度, 对同一目标
+                        // (IoU>0.3) 取两者最大, 避免"框对了但分数不够"被拒。
+                        for (size_t yi = 0; yi < objects.people.size(); ++yi) {
+                            float bx1 = objects.people[yi].x1, by1 = objects.people[yi].y1;
+                            float bx2 = objects.people[yi].x2, by2 = objects.people[yi].y2;
+                            float best = 0.0f;
+                            for (size_t ri = 0; ri < iva_objects.people.size(); ++ri) {
+                                const IvaObject& rp = iva_objects.people[ri];
+                                float ix1 = std::max(bx1, rp.x1), iy1 = std::max(by1, rp.y1);
+                                float ix2 = std::min(bx2, rp.x2), iy2 = std::min(by2, rp.y2);
+                                float iw = std::max(0.0f, ix2 - ix1), ih = std::max(0.0f, iy2 - iy1);
+                                float inter = iw * ih;
+                                float aa = (bx2 - bx1) * (by2 - by1);
+                                float bb = (rp.x2 - rp.x1) * (rp.y2 - rp.y1);
+                                float iou = inter / std::max(1e-6f, aa + bb - inter);
+                                if (iou > 0.3f && rp.score > best) best = rp.score;
+                            }
+                            if (best > objects.people[yi].score)
+                                objects.people[yi].score = best;
+                        }
+                    }
+                    goto scan_done;
+                }
                 if (frame.data_fd() >= 0) {
                     ok = iva.detect_fd(++iva_frame_id, frame.data_fd(),
                                        frame.yuv420_layout(), frame.width(),
@@ -768,6 +843,7 @@ int main(int argc, char* argv[]) {
                 } else if (frame.copy_nv12(compact_nv12)) {
                     ok = iva.detect_nv12(++iva_frame_id, compact_nv12.data(), frame.width(), frame.height(), objects);
                 }
+            scan_done:
                 double latency = (now_seconds() - begin) * 1000.0;
                 detector_latencies.push_back(latency);
                 if (detector_latencies.size() > 180) detector_latencies.erase(detector_latencies.begin());
