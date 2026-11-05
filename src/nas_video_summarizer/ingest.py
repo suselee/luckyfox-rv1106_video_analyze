@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -656,6 +656,10 @@ async def save_ingested_clip(
         staged_clip_path = Path(staging_dir) / clip_path.name
         audio_path = spool.job_audio_path(job_dir, meta)
         audio_demux = _audio_demux(meta) if audio_path is not None else None
+        # 拍摄时刻写入 MP4 creation_time, 供 Nextcloud/Immich 正确按天归档
+        clip_creation = datetime.fromtimestamp(
+            float(meta["clip_start"]), tz=timezone.utc
+        )
         try:
             await remux_elementary_stream(
                 settings,
@@ -666,6 +670,7 @@ async def save_ingested_clip(
                 audio_format=audio_demux[0] if audio_demux else None,
                 audio_rate=audio_demux[1] if audio_demux else None,
                 audio_channels=audio_demux[2] if audio_demux else None,
+                creation_time=clip_creation,
             )
         except RuntimeError:
             # 音频裸流损坏/编码误判时降级为纯视频重封装, 不阻塞片段保存。
@@ -680,6 +685,7 @@ async def save_ingested_clip(
                 video_path,
                 staged_clip_path,
                 es_format=_es_format(meta.get("codec")),
+                creation_time=clip_creation,
             )
         os.replace(staged_clip_path, clip_path)
 

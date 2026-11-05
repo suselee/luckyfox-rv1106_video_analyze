@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -552,6 +552,7 @@ async def remux_elementary_stream(
     audio_format: str | None = None,
     audio_rate: int | None = None,
     audio_channels: int | None = None,
+    creation_time: datetime | None = None,
 ) -> None:
     """把裸基本流 (H.264/H.265 Annex-B) 以 -c copy 重封装为 MP4。
 
@@ -592,6 +593,15 @@ async def remux_elementary_stream(
             command += ["-c:a", settings.clip_audio_codec, "-b:a", "192k"]
         else:
             command += ["-c:a", "copy"]
+    # 写入真实拍摄时刻: 裸流重封装出的 MP4 默认没有 creation_time,
+    # Nextcloud/Immich 只能退回文件 mtime, 而 mtime 按 UTC 分组会把
+    # 本地 08:00 之前的片段归到前一天。这里写成 UTC ISO-8601, 由
+    # 客户端按自身时区换算。
+    if creation_time is not None:
+        stamp = creation_time.astimezone(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000000Z"
+        )
+        command += ["-metadata", f"creation_time={stamp}"]
     command += [
         "-movflags",
         "+faststart",
