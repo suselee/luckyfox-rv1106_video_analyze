@@ -363,7 +363,8 @@ class DaughterDetector:
         board_person_score_threshold: float = 0.70,
         max_person_height_limit: float = 0.0,
         required_child_face_frames: int = 1,
-        child_face_max_person_height: float = 0.0,
+        board_box_height: float = 0.0,
+        child_face_max_board_height: float = 0.0,
     ) -> ProbableVerification:
         """Verify a board body-track event using event-local cropped frames.
 
@@ -426,15 +427,17 @@ class DaughterDetector:
             reason = "repeated daughter ONNX evidence"
         elif child_face_frames >= required_child_faces:
             # 年龄模型在侧脸上不可靠 (实测奶奶侧脸被判 child=1.00), 因此
-            # child_face 还必须通过人体尺寸闸门: 成人尺寸的框直接否决。
+            # child_face 还必须通过尺寸闸门。这里用**板端原始框高度**而不是
+            # 校验帧里的人体框: ROI 校验帧是紧裁剪, 人几乎占满, 高度恒 ~1.0,
+            # 拿它做判据会把女儿(真相)一起拒掉。
             if (
-                child_face_max_person_height > 0.0
-                and max_person_height > child_face_max_person_height
+                child_face_max_board_height > 0.0
+                and board_box_height > child_face_max_board_height
             ):
                 decision = "child_face_too_tall"
                 reason = (
-                    "child face but person box exceeds height limit "
-                    f"({max_person_height:.2f} > {child_face_max_person_height:.2f})"
+                    "child face but board box exceeds height limit "
+                    f"({board_box_height:.2f} > {child_face_max_board_height:.2f})"
                 )
             else:
                 accepted = True

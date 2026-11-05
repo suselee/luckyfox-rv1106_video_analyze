@@ -322,6 +322,30 @@ def _moment_period(
     return None
 
 
+def _board_box_height(meta: dict[str, Any]) -> float:
+    """板端上传 meta 里的人体框高度 (归一化, 全帧坐标系)。
+
+    板端 box/best_box 语义为 (x1, y1, x2, y2); 若数值 > 1.5 视为像素坐标,
+    用 frame_height 归一化。无法解析时返回 0.0 (闸门不生效)。
+    """
+    raw = meta.get("best_box") or meta.get("box")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return 0.0
+    try:
+        x1, y1, x2, y2 = (float(v) for v in raw)
+    except (TypeError, ValueError):
+        return 0.0
+    height = y2 - y1
+    if height <= 0:
+        return 0.0
+    if max(abs(x1), abs(y1), abs(x2), abs(y2)) > 1.5:
+        frame_height = float(meta.get("frame_height") or 0)
+        if frame_height <= 0:
+            return 0.0
+        height /= frame_height
+    return min(1.0, height)
+
+
 def _normalized_board_roi(
     meta: dict[str, Any],
     *,
@@ -444,7 +468,8 @@ async def _verify_probable_clip(
                 settings.rv1106_verify_board_person_score
             ),
             required_child_face_frames=settings.rv1106_verify_child_face_frames,
-            child_face_max_person_height=(
+            board_box_height=_board_box_height(meta),
+            child_face_max_board_height=(
                 settings.rv1106_verify_child_face_max_person_height
             ),
         )
@@ -496,7 +521,8 @@ async def _verify_probable_clip(
                     required_child_face_frames=(
                         settings.rv1106_verify_child_face_frames
                     ),
-                    child_face_max_person_height=(
+                    board_box_height=_board_box_height(meta),
+                    child_face_max_board_height=(
                         settings.rv1106_verify_child_face_max_person_height
                     ),
                 )

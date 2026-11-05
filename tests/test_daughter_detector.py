@@ -150,7 +150,8 @@ def test_board_probable_rejects_child_face_on_adult_sized_box(monkeypatch, tmp_p
     result = detector.verify_board_probable_paths(
         paths,
         required_frames=2,
-        child_face_max_person_height=0.45,
+        board_box_height=0.64,          # 板端框为成人尺寸
+        child_face_max_board_height=0.45,
     )
 
     assert result.accepted is False
@@ -171,7 +172,8 @@ def test_board_probable_child_face_requires_configured_frames(monkeypatch, tmp_p
         paths,
         required_frames=2,
         required_child_face_frames=2,
-        child_face_max_person_height=0.45,
+        board_box_height=0.37,
+        child_face_max_board_height=0.45,
     )
 
     assert result.accepted is False
