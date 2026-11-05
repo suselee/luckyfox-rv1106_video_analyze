@@ -71,6 +71,17 @@ _AGE_PROTO_URL = (
 _AGE_MODEL_URL = (
     "https://www.dropbox.com/s/xfb20y596869vbb/age_net.caffemodel?dl=1"
 )
+# YuNet: 正脸 + 侧脸 + 小脸, 227KB, OpenCV 4.5.4+ 自带 FaceDetectorYN。
+# SSD (opencv_face_detector) 只认正脸, 片段里大人侧脸/背对时 face_count 恒为 0,
+# 导致 probable 校验只能落到 faceless_person。YuNet 作为首选, SSD 保留兜底。
+_FACE_YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
+_FACE_YUNET_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+_FACE_YUNET_SCORE_THRESHOLD = 0.6
+_FACE_YUNET_NMS_THRESHOLD = 0.3
+
 _AGE_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 _CHILD_AGE_BUCKETS = 3
 
@@ -112,6 +123,19 @@ def _ensure_age_models(model_dir: Path = _MODEL_DIR) -> tuple[Path, Path, Path, 
         if not path.exists():
             _download(url, path)
     return tuple(path for path, _ in assets)
+
+
+def _ensure_yunet(model_dir: Path = _MODEL_DIR) -> Path | None:
+    """返回 YuNet 模型路径; 不可用 (下载失败/OpenCV 过旧) 时返回 None。"""
+    try:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        path = model_dir / _FACE_YUNET_FILENAME
+        if not path.exists():
+            _download(_FACE_YUNET_URL, path)
+        return path
+    except Exception as exc:  # noqa: BLE001 - 模型不可用不应中断服务
+        print(f"[PERSON_FILTER] YuNet unavailable: {exc}", flush=True)
+        return None
 
 
 def _download(url: str, dest: Path) -> None:
@@ -169,6 +193,7 @@ class PersonFilter:
         self._model_path = None
         self._face_net = None
         self._age_net = None
+        self._yunet = None
 
     def prepare(self) -> Path:
         """Download and load the configured model, returning its local path."""
@@ -209,6 +234,24 @@ class PersonFilter:
         for net in (self._face_net, self._age_net):
             net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
             net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+        # YuNet (正脸+侧脸) 优先; OpenCV 版本过旧或模型缺失时退回 SSD
+        self._yunet = None
+        if hasattr(cv2, "FaceDetectorYN"):
+            yunet_path = _ensure_yunet(self._model_dir)
+            if yunet_path is not None:
+                try:
+                    self._yunet = cv2.FaceDetectorYN.create(
+                        str(yunet_path),
+                        "",
+                        (320, 320),
+                        _FACE_YUNET_SCORE_THRESHOLD,
+                        _FACE_YUNET_NMS_THRESHOLD,
+                        5000,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[PERSON_FILTER] YuNet init failed: {exc}", flush=True)
+                    self._yunet = None
 
     def detect(
         self, image_b64: str, *, classify_age: bool = True
@@ -349,13 +392,32 @@ class PersonFilter:
             "person_boxes": normalized_boxes,
         }
 
-    def _classify_ages(
-        self, img, person_boxes: list[list[float]]
-    ) -> dict[str, object]:
-        if not person_boxes:
-            return self._age_result()
+    def _detect_faces(self, img, width: int, height: int) -> list[tuple[float, float, float, float]]:
+        """检测人脸, 返回像素坐标 (x1, y1, x2, y2) 列表。
 
-        height, width = img.shape[:2]
+        YuNet 优先: 支持侧脸与小脸 (SSD 的 opencv_face_detector 只认正脸,
+        实测片段里大人侧脸/背对时 face_count 恒为 0)。YuNet 无结果或初始化
+        失败时退回 SSD, 保证旧行为可用。
+        """
+        if self._yunet is not None:
+            try:
+                self._yunet.setInputSize((width, height))
+                _, raw = self._yunet.detect(img)
+                faces: list[tuple[float, float, float, float]] = []
+                if raw is not None:
+                    for face in raw:
+                        x, y, w, h = (float(v) for v in face[:4])
+                        confidence = float(face[-1])
+                        if confidence < _FACE_YUNET_SCORE_THRESHOLD:
+                            continue
+                        if w <= 0 or h <= 0:
+                            continue
+                        faces.append((x, y, x + w, y + h))
+                if faces:
+                    return faces
+            except Exception as exc:  # noqa: BLE001 - 退化为 SSD
+                print(f"[PERSON_FILTER] YuNet detect failed: {exc}", flush=True)
+
         blob = self._cv2.dnn.blobFromImage(
             img,
             1.0,
@@ -366,20 +428,32 @@ class PersonFilter:
         )
         self._face_net.setInput(blob)
         detections = self._face_net.forward()
-
-        matched_people: set[int] = set()
-        adult_scores: list[float] = []
-        child_scores: list[float] = []
-        face_count = 0
+        faces = []
         for index in range(detections.shape[2]):
             confidence = float(detections[0, 0, index, 2])
             if confidence < self._face_threshold:
                 continue
             x1, y1, x2, y2 = (float(v) for v in detections[0, 0, index, 3:7])
-            x1 = max(0, min(width - 1, int(x1 * width)))
-            y1 = max(0, min(height - 1, int(y1 * height)))
-            x2 = max(x1 + 1, min(width, int(x2 * width)))
-            y2 = max(y1 + 1, min(height, int(y2 * height)))
+            faces.append((x1 * width, y1 * height, x2 * width, y2 * height))
+        return faces
+
+    def _classify_ages(
+        self, img, person_boxes: list[list[float]]
+    ) -> dict[str, object]:
+        if not person_boxes:
+            return self._age_result()
+
+        height, width = img.shape[:2]
+
+        matched_people: set[int] = set()
+        adult_scores: list[float] = []
+        child_scores: list[float] = []
+        face_count = 0
+        for raw_x1, raw_y1, raw_x2, raw_y2 in self._detect_faces(img, width, height):
+            x1 = max(0, min(width - 1, int(raw_x1)))
+            y1 = max(0, min(height - 1, int(raw_y1)))
+            x2 = max(x1 + 1, min(width, int(raw_x2)))
+            y2 = max(y1 + 1, min(height, int(raw_y2)))
             match = self._matching_person(
                 ((x1 + x2) / (2 * width), (y1 + y2) / (2 * height)),
                 person_boxes,
