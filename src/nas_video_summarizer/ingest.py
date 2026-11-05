@@ -385,7 +385,8 @@ async def _verify_probable_clip(
     video_path: Path,
     meta: dict[str, Any],
     detector: Any,
-) -> tuple[bool, str]:
+    job_key: str = "",
+) -> tuple[bool, str, Any]:
     """对板端上传切片自身抽帧校验是否含儿童证据。
 
     上传物是裸 Annex-B 基本流 (无容器时间戳), ffmpeg -ss 输入侧寻址
@@ -442,6 +443,10 @@ async def _verify_probable_clip(
             board_person_score_threshold=(
                 settings.rv1106_verify_board_person_score
             ),
+            required_child_face_frames=settings.rv1106_verify_child_face_frames,
+            child_face_max_person_height=(
+                settings.rv1106_verify_child_face_max_person_height
+            ),
         )
         if not verification.accepted:
             # 2026-11-04: 板端新模型的 probable 检测框可能指向非人体区域
@@ -462,11 +467,20 @@ async def _verify_probable_clip(
                 if frame_path.exists():
                     full_frames.append(frame_path)
             if full_frames:
+                # 2026-11-05 收紧: faceless_person 只证明"画面里有人", 不证明
+                # "画面里是小孩"。整帧回退若照单全收, 会把"只有大人"的片段
+                # (爸爸坐沙发 / 奶奶洗衣服) 合法化。默认只接受带儿童证据的
+                # 结论 (child_face / daughter_onnx); 确需放宽时置
+                # RV1106_VERIFY_FALLBACK_ALLOW_FACELESS=true, 并叠加更高的
+                # 人体帧数门槛与人体框高度上限两道硬约束。
+                allow_faceless = settings.rv1106_verify_fallback_allow_faceless
                 fallback = detector.verify_board_probable_paths(
                     full_frames,
                     required_frames=2,
                     required_person_frames=(
-                        settings.rv1106_verify_person_frames
+                        settings.rv1106_verify_fallback_person_frames
+                        if allow_faceless
+                        else settings.rv1106_verify_person_frames
                     ),
                     board_score=float(meta.get("score") or 0.0),
                     board_person_score=float(meta.get("person_score") or 0.0),
@@ -474,12 +488,36 @@ async def _verify_probable_clip(
                     board_person_score_threshold=(
                         settings.rv1106_verify_board_person_score
                     ),
+                    max_person_height_limit=(
+                        settings.rv1106_verify_fallback_max_person_height
+                        if allow_faceless
+                        else 0.0
+                    ),
+                    required_child_face_frames=(
+                        settings.rv1106_verify_child_face_frames
+                    ),
+                    child_face_max_person_height=(
+                        settings.rv1106_verify_child_face_max_person_height
+                    ),
                 )
-                if fallback.accepted:
-                    print(
-                        "[INGEST] verify roi-miss, accepted on full frame",
-                        flush=True,
-                    )
+                accept_fallback = fallback.accepted and (
+                    allow_faceless or fallback.decision != "faceless_person"
+                )
+                fb_person_frames = getattr(fallback, "person_frames", 0)
+                fb_max_h = float(
+                    getattr(fallback, "max_person_height", 0.0) or 0.0
+                )
+                print(
+                    f"[INGEST] {job_key}: roi-miss fallback "
+                    f"decision={fallback.decision} "
+                    f"person_frames={fb_person_frames} "
+                    f"max_h={fb_max_h:.2f} "
+                    f"board={float(meta.get('score') or 0.0):.2f}/"
+                    f"{float(meta.get('person_score') or 0.0):.2f} -> "
+                    f"{'accepted' if accept_fallback else 'rejected'}",
+                    flush=True,
+                )
+                if accept_fallback:
                     verification = fallback
         return verification.accepted, verification.decision, verification
 
@@ -538,7 +576,7 @@ async def save_ingested_clip(
             )
         else:
             accepted, decision, verification = await _verify_probable_clip(
-                settings, video_path, meta, probable_verifier
+                settings, video_path, meta, probable_verifier, job_key=key
             )
             verify_decision = decision
             if not accepted:

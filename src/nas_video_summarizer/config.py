@@ -245,6 +245,11 @@ class Settings:
     rv1106_verify_board_score: float
     rv1106_verify_board_person_score: float
     rv1106_verify_faceless_score_multiplier: float
+    rv1106_verify_fallback_allow_faceless: bool
+    rv1106_verify_fallback_person_frames: int
+    rv1106_verify_fallback_max_person_height: float
+    rv1106_verify_child_face_frames: int
+    rv1106_verify_child_face_max_person_height: float
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -417,6 +422,22 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ),
         rv1106_verify_faceless_score_multiplier=_float(
             "RV1106_VERIFY_FACELESS_SCORE_MULTIPLIER", 0.75
+        ),
+        # 整帧回退收紧: 默认只接受带儿童证据的结论, 不接受 faceless_person
+        rv1106_verify_fallback_allow_faceless=_bool(
+            "RV1106_VERIFY_FALLBACK_ALLOW_FACELESS", False
+        ),
+        rv1106_verify_fallback_person_frames=_int(
+            "RV1106_VERIFY_FALLBACK_PERSON_FRAMES", 4
+        ),
+        rv1106_verify_fallback_max_person_height=_float(
+            "RV1106_VERIFY_FALLBACK_MAX_PERSON_HEIGHT", 0.45
+        ),
+        rv1106_verify_child_face_frames=_int(
+            "RV1106_VERIFY_CHILD_FACE_FRAMES", 2
+        ),
+        rv1106_verify_child_face_max_person_height=_float(
+            "RV1106_VERIFY_CHILD_FACE_MAX_PERSON_HEIGHT", 0.45
         ),
     )
 

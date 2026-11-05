@@ -133,6 +133,51 @@ def test_board_probable_accepts_one_child_face(monkeypatch, tmp_path):
     assert "child_face" in result.evidence
 
 
+def test_board_probable_rejects_child_face_on_adult_sized_box(monkeypatch, tmp_path):
+    """年龄模型在侧脸上会误判 (实测奶奶侧脸 child=1.00), 需要人体尺寸闸门。"""
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(3)]
+    adult_box = {
+        "person_score": 0.9,
+        "person_boxes": [[0.2, 0.1, 0.3, 0.64]],   # 高 0.64 -> 成人尺寸
+        "face_count": 1,
+        "child_score": 1.0,
+        "adult_score": 0.0,
+        "adult_only": False,
+    }
+    _mock_board_frame_info(monkeypatch, detector, [adult_box, adult_box, adult_box])
+
+    result = detector.verify_board_probable_paths(
+        paths,
+        required_frames=2,
+        child_face_max_person_height=0.45,
+    )
+
+    assert result.accepted is False
+    assert result.decision == "child_face_too_tall"
+
+
+def test_board_probable_child_face_requires_configured_frames(monkeypatch, tmp_path):
+    """child_face 帧数门槛: 只有 1 帧命中时不接受 (默认 2)。"""
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(3)]
+    _mock_board_frame_info(
+        monkeypatch,
+        detector,
+        [_frame_info(faces=1, child=0.8), _frame_info(faces=1, child=0.1), _frame_info()],
+    )
+
+    result = detector.verify_board_probable_paths(
+        paths,
+        required_frames=2,
+        required_child_face_frames=2,
+        child_face_max_person_height=0.45,
+    )
+
+    assert result.accepted is False
+    assert result.decision != "child_face"
+
+
 def test_board_probable_rejects_repeated_adult_faces(monkeypatch, tmp_path):
     detector = DaughterDetector(load_settings("/nonexistent.env"))
     paths = [tmp_path / f"frame-{index}.jpg" for index in range(5)]

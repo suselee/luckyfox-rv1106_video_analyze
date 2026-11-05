@@ -38,6 +38,7 @@ class ProbableVerification:
     child_face_frames: int = 0
     adult_face_frames: int = 0
     max_person_score: float = 0.0
+    max_person_height: float = 0.0
 
 
 class DaughterDetector:
@@ -360,6 +361,9 @@ class DaughterDetector:
         board_person_score: float = 0.0,
         board_score_threshold: float = 0.70,
         board_person_score_threshold: float = 0.70,
+        max_person_height_limit: float = 0.0,
+        required_child_face_frames: int = 1,
+        child_face_max_person_height: float = 0.0,
     ) -> ProbableVerification:
         """Verify a board body-track event using event-local cropped frames.
 
@@ -398,8 +402,20 @@ class DaughterDetector:
             (float(info.get("person_score", 0.0)) for info in frame_infos),
             default=0.0,
         )
+        # person_boxes 为归一化 [x, y, w, h], 取全帧最大人体框高度。
+        # 整帧校验时该值可用于排除"凑近镜头的大人"(成人普遍 > 0.55)。
+        max_person_height = max(
+            (
+                float(box[3])
+                for info in frame_infos
+                for box in (info.get("person_boxes") or [])
+                if isinstance(box, (list, tuple)) and len(box) >= 4
+            ),
+            default=0.0,
+        )
         required = max(1, required_frames)
         required_people = max(1, required_person_frames)
+        required_child_faces = max(1, required_child_face_frames)
 
         accepted = False
         decision = "inconclusive"
@@ -408,10 +424,22 @@ class DaughterDetector:
             accepted = True
             decision = "daughter_onnx"
             reason = "repeated daughter ONNX evidence"
-        elif child_face_frames >= 1:
-            accepted = True
-            decision = "child_face"
-            reason = "independent child face-age evidence"
+        elif child_face_frames >= required_child_faces:
+            # 年龄模型在侧脸上不可靠 (实测奶奶侧脸被判 child=1.00), 因此
+            # child_face 还必须通过人体尺寸闸门: 成人尺寸的框直接否决。
+            if (
+                child_face_max_person_height > 0.0
+                and max_person_height > child_face_max_person_height
+            ):
+                decision = "child_face_too_tall"
+                reason = (
+                    "child face but person box exceeds height limit "
+                    f"({max_person_height:.2f} > {child_face_max_person_height:.2f})"
+                )
+            else:
+                accepted = True
+                decision = "child_face"
+                reason = "independent child face-age evidence"
         elif adult_face_frames >= 2:
             decision = "adult_face"
             reason = "repeated adult-only face evidence"
@@ -424,9 +452,20 @@ class DaughterDetector:
             and board_score >= board_score_threshold
             and board_person_score >= board_person_score_threshold
         ):
-            accepted = True
-            decision = "faceless_person"
-            reason = "stable person ROI with strong board evidence"
+            if (
+                max_person_height_limit > 0.0
+                and max_person_height > max_person_height_limit
+            ):
+                # 画面里有人, 但最大人体框过高 -> 更像是凑近镜头的大人
+                decision = "faceless_person_too_tall"
+                reason = (
+                    "faceless person box exceeds height limit "
+                    f"({max_person_height:.2f} > {max_person_height_limit:.2f})"
+                )
+            else:
+                accepted = True
+                decision = "faceless_person"
+                reason = "stable person ROI with strong board evidence"
         elif person_frames == 0:
             decision = "no_person"
             reason = "no person detected in the board ROI"
@@ -453,4 +492,5 @@ class DaughterDetector:
             child_face_frames=child_face_frames,
             adult_face_frames=adult_face_frames,
             max_person_score=max_person_score,
+            max_person_height=max_person_height,
         )

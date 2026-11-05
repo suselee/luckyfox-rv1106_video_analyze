@@ -18,3 +18,7 @@ edge/rv1106/board_service/person_probe
 edge/rv1106/board_service/audio_capture
 edge/rv1106/board_service/install/
 /check*_*.onnx
+
+# 运行时自动下载的人脸/人体模型权重 (person_filter)
+src/nas_video_summarizer/_person_filter_models/
+.omo/
