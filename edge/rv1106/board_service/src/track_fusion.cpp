@@ -135,7 +135,12 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.wide_streak = 0;
         }
         bool absolute_child = height >= 0.12f && height <= config_.child_max_height_ratio;
+        // 相对身高判定必须带最小尺寸: 否则任何贴着大人的小目标 (玩具/瓶子/
+        // 桌上杂物的误检框, 实测 13x29px) 都会满足 "比最高的人矮 65%" 而被
+        // 当成儿童, 进而升 probable 并上传 (NAS 整帧回退再放行 => 只含大人
+        // 的片段落盘)。0.12 与 absolute_child 的下限保持一致。
         bool relative_child = detections.people.size() > 1 && tallest > 0 &&
+                              height >= 0.12f &&
                               height <= tallest * config_.relative_child_height_ratio;
         track.child_like = relative_child ||
                            (detections.people.size() == 1 && absolute_child);

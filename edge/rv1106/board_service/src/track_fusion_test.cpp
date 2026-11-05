@@ -322,6 +322,28 @@ int main() {
         assert(events[0].identity == "probable");
     }
 
+    // 相对身高误判回归: 大人旁边的小目标框 (玩具/桌面杂物, 实测 13x29px,
+    // 归一化高 0.08) 不得被判成儿童。旧逻辑只比较 "比最高的人矮 65%",
+    // 没有最小尺寸, 于是任何小框都被当成女儿并升 probable。
+    {
+        FusionConfig tcfg = test_config();
+        TrackFusion rel(tcfg);
+        for (int i = 0; i < 8; ++i) {
+            IvaResult r;
+            IvaObject adult = {};
+            adult.id = 1; adult.score = 0.9f;
+            adult.x1 = 0.30f; adult.y1 = 0.20f; adult.x2 = 0.45f; adult.y2 = 0.85f;  // 高 0.65
+            IvaObject junk = {};
+            junk.id = 2; junk.score = 0.9f;
+            junk.x1 = 0.50f; junk.y1 = 0.78f; junk.x2 = 0.52f; junk.y2 = 0.87f;     // 高 0.09
+            r.people.push_back(adult);
+            r.people.push_back(junk);
+            rel.observe((double)i, r);
+            assert(rel.collect_events((double)i).empty());
+        }
+        assert(rel.probable_tracks() == 0);
+    }
+
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;
 }
