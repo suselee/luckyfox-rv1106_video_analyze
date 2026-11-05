@@ -34,6 +34,13 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         // 低置信度检出直接忽略: 不建轨迹、不刷新已有轨迹
         if (config_.person_min_score > 0 && person.score < config_.person_min_score)
             continue;
+        // 画面底边的小框 = 镜头脚下的杂物 (地垫边缘/桌腿/玩具), 不可能是人:
+        // 真人站在底边时框高必然很大, 远处的女儿则落在画面中部。
+        // 实测误报框 (26x52px, y2=0.994) 正是这样被当成儿童并升 probable 的。
+        {
+            float bh = person.y2 - person.y1;
+            if (person.y2 >= 0.97f && bh < 0.30f) continue;
+        }
         Track* selected = NULL;
         float best_match = -1e9f;
         for (std::map<uint32_t, Track>::iterator candidate = tracks_.begin();

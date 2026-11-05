@@ -344,6 +344,26 @@ int main() {
         assert(rel.probable_tracks() == 0);
     }
 
+    // 底边小框回归: 画面底部 26x52px 的杂物框 (y2=0.994, 高 0.144) 不得建轨迹,
+    // 更不得判成儿童。旧逻辑里它高过 0.12 下限, 会升 probable 并上传。
+    {
+        FusionConfig bcfg = test_config();
+        bcfg.person_min_score = 0.0f;   // 单独验证几何规则
+        TrackFusion bottom(bcfg);
+        for (int i = 0; i < 8; ++i) {
+            IvaResult r;
+            IvaObject junk = {};
+            junk.id = 1; junk.score = 0.9f;
+            junk.x1 = 0.6395f; junk.y1 = 0.8502f;
+            junk.x2 = 0.6798f; junk.y2 = 0.9942f;   // 高 0.144, 贴底边
+            r.people.push_back(junk);
+            bottom.observe((double)i, r);
+            assert(bottom.collect_events((double)i).empty());
+        }
+        assert(bottom.probable_tracks() == 0);
+        assert(bottom.active_tracks() == 0);
+    }
+
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;
 }
