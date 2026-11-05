@@ -472,6 +472,9 @@ async def _verify_probable_clip(
             child_face_max_board_height=(
                 settings.rv1106_verify_child_face_max_person_height
             ),
+            faceless_max_board_height=(
+                settings.rv1106_verify_child_face_max_person_height
+            ),
         )
         if not verification.accepted:
             # 2026-11-04: 板端新模型的 probable 检测框可能指向非人体区域
@@ -524,6 +527,11 @@ async def _verify_probable_clip(
                     board_box_height=_board_box_height(meta),
                     child_face_max_board_height=(
                         settings.rv1106_verify_child_face_max_person_height
+                    ),
+                    faceless_max_board_height=(
+                        settings.rv1106_verify_child_face_max_person_height
+                        if allow_faceless
+                        else 0.0
                     ),
                 )
                 accept_fallback = fallback.accepted and (

@@ -365,6 +365,7 @@ class DaughterDetector:
         required_child_face_frames: int = 1,
         board_box_height: float = 0.0,
         child_face_max_board_height: float = 0.0,
+        faceless_max_board_height: float = 0.0,
     ) -> ProbableVerification:
         """Verify a board body-track event using event-local cropped frames.
 
@@ -455,15 +456,19 @@ class DaughterDetector:
             and board_score >= board_score_threshold
             and board_person_score >= board_person_score_threshold
         ):
+            # 尺寸闸门优先用板端原始框高度 (全帧坐标, 与裁剪方式无关);
+            # 未提供时退回校验帧内的人体框高度 (整帧回退场景两者等价)。
+            gate_height = board_box_height if board_box_height > 0.0 else max_person_height
+            gate_limit = faceless_max_board_height if faceless_max_board_height > 0.0 else max_person_height_limit
             if (
-                max_person_height_limit > 0.0
-                and max_person_height > max_person_height_limit
+                gate_limit > 0.0
+                and gate_height > gate_limit
             ):
                 # 画面里有人, 但最大人体框过高 -> 更像是凑近镜头的大人
                 decision = "faceless_person_too_tall"
                 reason = (
                     "faceless person box exceeds height limit "
-                    f"({max_person_height:.2f} > {max_person_height_limit:.2f})"
+                    f"({gate_height:.2f} > {gate_limit:.2f})"
                 )
             else:
                 accepted = True

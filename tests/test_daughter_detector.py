@@ -133,6 +133,28 @@ def test_board_probable_accepts_one_child_face(monkeypatch, tmp_path):
     assert "child_face" in result.evidence
 
 
+def test_board_probable_faceless_rejected_when_board_box_is_adult_sized(monkeypatch, tmp_path):
+    """ROI 主路径的 faceless 也要过尺寸闸门 (板端框高度为准, 不用 ROI 帧高度)。"""
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(3)]
+    _mock_board_frame_info(
+        monkeypatch, detector, [_frame_info() for _ in range(3)]
+    )
+
+    result = detector.verify_board_probable_paths(
+        paths,
+        required_frames=2,
+        required_person_frames=3,
+        board_score=1.0,
+        board_person_score=1.0,
+        board_box_height=0.64,          # 板端框是成人尺寸
+        faceless_max_board_height=0.45,
+    )
+
+    assert result.accepted is False
+    assert result.decision == "faceless_person_too_tall"
+
+
 def test_board_probable_rejects_child_face_on_adult_sized_box(monkeypatch, tmp_path):
     """年龄模型在侧脸上会误判 (实测奶奶侧脸 child=1.00), 需要人体尺寸闸门。"""
     detector = DaughterDetector(load_settings("/nonexistent.env"))
