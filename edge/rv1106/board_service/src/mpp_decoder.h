@@ -60,6 +60,14 @@ public:
     // Nv12Frame is destroyed. This lets RockIVA consume the DMA fd directly.
     bool get_frame(Nv12Frame& frame, int timeout_ms);
 
+    // 诊断: 打印 VDEC 通道状态 (输入积压/待输出图/解码帧计数/错误计数)。
+    // 用于解码停滞时判断是"输入没被消费"还是"消费了但不产帧"。
+    void dump_status(const char* tag) const;
+
+    // 累计计数 (仅诊断用): send 失败次数, get_frame 空轮询次数。
+    uint32_t send_fail_count() const { return send_fail_; }
+    uint32_t get_empty_count() const { return get_empty_; }
+
 private:
     int         chn_    = 0;
     uint32_t    pool_   = 0;   // MB_POOL
@@ -67,6 +75,8 @@ private:
     bool        chn_ok_ = false;
     int         max_w_  = 1920;
     int         max_h_  = 1080;
+    uint32_t    send_fail_  = 0;
+    uint32_t    get_empty_  = 0;
 };
 
 } // namespace dw

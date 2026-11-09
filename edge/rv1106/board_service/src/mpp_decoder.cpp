@@ -284,7 +284,10 @@ bool MppDecoder::init() {
 
     if (RK_MPI_VDEC_CreateChn(chn_, &attr) != RK_SUCCESS) {
         printf("[MPP] VDEC_CreateChn failed\n");
+        // 必须清零: 调用方随后会调用 deinit(), 否则会对同一 pool 二次
+        // DestroyPool, 破坏 MB 子系统 (RV1106 上表现为后续重建失败)。
         RK_MPI_MB_DestroyPool(pool_);
+        pool_ = 0;
         return false;
     }
     chn_ok_ = true;
@@ -334,6 +337,7 @@ bool MppDecoder::send(const uint8_t* data, int len, uint64_t pts, bool end_of_fr
     // 失败时丢该块 (中间帧), 关键帧稍后会再到达。
     RK_S32 ret = RK_MPI_VDEC_SendStream(chn_, &st, 0);
     RK_MPI_MB_ReleaseMB(blk);
+    if (ret != RK_SUCCESS) ++send_fail_;
     return ret == RK_SUCCESS;
 }
 
@@ -352,6 +356,30 @@ bool MppDecoder::get_rgb(std::vector<uint8_t>& rgb, int& out_w, int& out_h,
     return frame.to_rgb(rgb);
 }
 
+void MppDecoder::dump_status(const char* tag) const {
+    VDEC_CHN_STATUS_S st;
+    memset(&st, 0, sizeof(st));
+    RK_S32 ret = chn_ok_ ? RK_MPI_VDEC_QueryStatus(chn_, &st) : -1;
+    if (ret != RK_SUCCESS) {
+        printf("[MPP] %s status query failed ret=%d (chn_ok=%d)\n", tag, ret, (int)chn_ok_);
+        return;
+    }
+    printf("[MPP] %s leftBytes=%u leftFrames=%u leftPics=%u recvFrames=%u "
+           "decodedFrames=%u startRecv=%d\n",
+           tag, st.u32LeftStreamBytes, st.u32LeftStreamFrames, st.u32LeftPics,
+           st.u32RecvStreamFrames, st.u32DecodeStreamFrames,
+           (int)st.bStartRecvStream);
+    // 解码错误分类计数: 哪个非零就指向哪类输入问题
+    printf("[MPP] %s decErr fmt=%d size=%d unsprt=%d pack=%d prtcl=%d ref=%d bufsz=%d oversz=%d notrelease=%d\n",
+           tag, st.stVdecDecErr.s32FormatErr, st.stVdecDecErr.s32PicSizeErrSet,
+           st.stVdecDecErr.s32StreamUnsprt, st.stVdecDecErr.s32PackErr,
+           st.stVdecDecErr.s32PrtclNumErrSet, st.stVdecDecErr.s32RefErrSet,
+           st.stVdecDecErr.s32PicBufSizeErrSet, st.stVdecDecErr.s32StreamSizeOver,
+           st.stVdecDecErr.s32VdecStreamNotRelease);
+    printf("[MPP] %s counters: send_fail=%u get_empty=%u\n",
+           tag, send_fail_, get_empty_);
+}
+
 bool MppDecoder::get_frame(Nv12Frame& frame, int timeout_ms) {
     if (!inited_) return false;
     frame.release();
@@ -359,6 +387,7 @@ bool MppDecoder::get_frame(Nv12Frame& frame, int timeout_ms) {
     memset(fi, 0, sizeof(*fi));
     if (RK_MPI_VDEC_GetFrame(chn_, fi, timeout_ms) != RK_SUCCESS) {
         delete fi;
+        ++get_empty_;
         return false;
     }
     frame.frame_info_ = fi;

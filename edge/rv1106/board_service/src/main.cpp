@@ -490,6 +490,8 @@ int main(int argc, char* argv[]) {
     double init_fail_since = -1e9;  // init 连续失败起始时刻 (熔断用)
     double last_frame_ts = -1e9;    // 最近解出帧的时刻 (解码停滞看门狗)
     int nodecode_rebuilds = 0;      // 无帧重建计数 (达限则退出)
+    long idrs_at_last_frame = 0;    // 上次出帧时的 IDR 计数 (判断停摆是否因缺关键帧)
+    double last_nodecode_log = -1e9;
     int reconnect_wait = 2;
 
     printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
@@ -644,7 +646,9 @@ int main(int argc, char* argv[]) {
             // 重建成功: 熔断计时清零; 解码看门狗给足宽限 (从此刻起算)。
             init_fail_since = -1e9;
             last_frame_ts = now_seconds();
-            nodecode_rebuilds = 0;
+            // 注意: 这里不清零 nodecode_rebuilds。只要还没解出帧, 重建次数
+            // 就必须继续累计, 否则下面的"连续重建 2 次仍无帧 → 退出"永远
+            // 不可达, 会退化成每 60s 无限重建。计数在真正解出帧时清零。
             printf("[SCHEDULE] active window started; RTSP and decoder running\n");
         }
 
@@ -744,6 +748,18 @@ int main(int argc, char* argv[]) {
         // 注意字节看门狗此时不会触发 (last_stream_data 持续刷新), 必须独立判断。
         if (last_frame_ts > 0 &&
             now_seconds() - last_frame_ts > NODECODE_REBUILD_SECONDS) {
+            // 停摆期间若根本没收到新的 IDR, 就不是解码器卡死 (摄像头没发关键帧
+            // 或 GOP 过长), 重建没有意义 —— 继续等, 只做节流告警。
+            if (session_idrs <= idrs_at_last_frame) {
+                if (now_seconds() - last_nodecode_log > 60.0) {
+                    last_nodecode_log = now_seconds();
+                    printf("[DIAG] no frame %.0fs but no new IDR (feeds=%ld idrs=%ld); waiting\n",
+                           now_seconds() - last_frame_ts, session_feeds, session_idrs);
+                }
+                sleep(1);
+                continue;
+            }
+            decoder.dump_status("wedge");
             if (++nodecode_rebuilds > NODECODE_REBUILD_LIMIT) {
                 printf("[DIAG] no decoded frames for %.0fs after %d rebuilds; exiting for supervisor restart\n",
                        now_seconds() - last_frame_ts, nodecode_rebuilds - 1);
@@ -784,6 +800,7 @@ int main(int argc, char* argv[]) {
             double now = now_seconds();
             last_frame_ts = now;
             nodecode_rebuilds = 0;
+            idrs_at_last_frame = session_idrs;
             int level = guard.level();
             double effective_fps = level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0);
             if (effective_fps <= 0) effective_fps = 0.5;
