@@ -511,6 +511,12 @@ int main(int argc, char* argv[]) {
                 stream_active = false;
                 reconnect_wait = 2;
                 last_health = -1e9;
+                // 窗口关闭: 把数据心跳复位到"从未收到"。否则第二天开窗瞬间
+                // last_stream_data 仍是昨晚的时刻 (实测 34200s 前), 120s/240s
+                // 看门狗会在第一帧到达前就触发退出, 每天固定多一次重启
+                // (对摄像头意味着一次额外的重连, 容易触发配额惩罚)。
+                last_stream_data = -1e9;
+                last_frame_ts = -1e9;
                 printf("[SCHEDULE] active window ended; decoder stopped (streams paused)\n");
             }
             if (g_high && g_high->running() && !g_high->paused()) {
