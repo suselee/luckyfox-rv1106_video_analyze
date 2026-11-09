@@ -431,7 +431,11 @@ int main(int argc, char* argv[]) {
     const double NO_DATA_EXIT_SECONDS = 240.0;
     // 解码停滞重建: 有字节流但解不出帧 (VDEC wedged) 超过该秒数 → 重建解码器,
     // 累计重建 2 次仍无帧 → 退出重建整条管线。
-    const double NODECODE_REBUILD_SECONDS = 180.0;
+    // 实测 VDEC 平均每 2-3 小时楔死一次 (字节在流、但 get_frame 连续 180s
+    // 返回空), 每次要盲等 3 分钟才重建 —— 4 天记录到 31 次, 累计约 1.5 小时
+    // 漏帧。正常解码在 1fps 抽样下每秒都有帧, 60s 无帧即可判定楔死,
+    // 把单次盲区从 180s 压到 60s。
+    const double NODECODE_REBUILD_SECONDS = 60.0;
     const int NODECODE_REBUILD_LIMIT = 2;
 
     SystemMonitor monitor;
