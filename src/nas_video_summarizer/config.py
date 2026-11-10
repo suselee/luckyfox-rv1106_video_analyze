@@ -248,6 +248,7 @@ class Settings:
     rv1106_verify_fallback_allow_faceless: bool
     rv1106_verify_fallback_person_frames: int
     rv1106_verify_fallback_max_person_height: float
+    rv1106_verify_child_face_enabled: bool
     rv1106_verify_child_face_frames: int
     rv1106_verify_child_face_max_person_height: float
 
@@ -432,6 +433,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ),
         rv1106_verify_fallback_max_person_height=_float(
             "RV1106_VERIFY_FALLBACK_MAX_PERSON_HEIGHT", 0.40
+        ),
+        rv1106_verify_child_face_enabled=_bool(
+            "RV1106_VERIFY_CHILD_FACE_ENABLED", False
         ),
         rv1106_verify_child_face_frames=_int(
             "RV1106_VERIFY_CHILD_FACE_FRAMES", 2

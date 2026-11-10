@@ -363,6 +363,7 @@ class DaughterDetector:
         board_person_score_threshold: float = 0.70,
         max_person_height_limit: float = 0.0,
         required_child_face_frames: int = 1,
+        child_face_enabled: bool = True,
         board_box_height: float = 0.0,
         child_face_max_board_height: float = 0.0,
         faceless_max_board_height: float = 0.0,
@@ -426,7 +427,7 @@ class DaughterDetector:
             accepted = True
             decision = "daughter_onnx"
             reason = "repeated daughter ONNX evidence"
-        elif child_face_frames >= required_child_faces:
+        elif child_face_enabled and child_face_frames >= required_child_faces:
             # 年龄模型在侧脸上不可靠 (实测奶奶侧脸被判 child=1.00), 因此
             # child_face 还必须通过尺寸闸门。这里用**板端原始框高度**而不是
             # 校验帧里的人体框: ROI 校验帧是紧裁剪, 人几乎占满, 高度恒 ~1.0,

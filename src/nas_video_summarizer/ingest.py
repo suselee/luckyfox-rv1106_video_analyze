@@ -467,6 +467,7 @@ async def _verify_probable_clip(
             board_person_score_threshold=(
                 settings.rv1106_verify_board_person_score
             ),
+            child_face_enabled=settings.rv1106_verify_child_face_enabled,
             required_child_face_frames=settings.rv1106_verify_child_face_frames,
             board_box_height=_board_box_height(meta),
             child_face_max_board_height=(
@@ -520,6 +521,9 @@ async def _verify_probable_clip(
                         settings.rv1106_verify_fallback_max_person_height
                         if allow_faceless
                         else 0.0
+                    ),
+                    child_face_enabled=(
+                        settings.rv1106_verify_child_face_enabled
                     ),
                     required_child_face_frames=(
                         settings.rv1106_verify_child_face_frames
