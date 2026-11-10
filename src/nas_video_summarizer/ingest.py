@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import os
 import re
 import tempfile
@@ -158,6 +159,8 @@ class IngestSpool:
         self.root = settings.board_ingest_dir
         self.pending_dir = self.root / "pending"
         self.failed_dir = self.root / "failed"
+        # 被校验拒绝的片段: 保留下来做训练负样本 (Phase 0)
+        self.rejected_dir = self.root / "rejected"
         self.pending_dir.mkdir(parents=True, exist_ok=True)
         self.failed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -227,6 +230,54 @@ class IngestSpool:
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         shutil.move(str(job_dir), str(target))
+
+    def archive_rejected(self, job_dir: Path, decision: str,
+                         meta: dict[str, Any] | None = None) -> Path | None:
+        """把被拒片段移到 rejected/, 并写 decision.json 供训练/审计。
+
+        之前拒绝即 rmtree, 导致"纯大人"这类硬负样本一条都留不下, 训练
+        儿童/成人分类器时无数据可用。
+        """
+        import shutil
+
+        if not job_dir.is_dir():
+            return None
+        try:
+            self.rejected_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            target = self.rejected_dir / f"{stamp}_{job_dir.name}"
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            shutil.move(str(job_dir), str(target))
+            info = {
+                "decision": decision,
+                "archived_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "meta": meta or {},
+            }
+            (target / "decision.json").write_text(
+                json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return target
+        except Exception as exc:  # noqa: BLE001 - 归档失败不应影响主流程
+            print(f"[INGEST] archive_rejected failed: {exc}", flush=True)
+            return None
+
+    def prune_rejected(self, retention_days: int) -> int:
+        """删除超过保留期的 rejected/ 子目录, 返回删除数量。"""
+        import shutil
+
+        if retention_days <= 0 or not self.rejected_dir.exists():
+            return 0
+        cutoff = time.time() - retention_days * 86400
+        removed = 0
+        for entry in self.rejected_dir.iterdir():
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+        return removed
 
     def pending_count(self) -> int:
         return len(self.pending_jobs())
@@ -476,6 +527,7 @@ async def _verify_probable_clip(
             faceless_max_board_height=(
                 settings.rv1106_verify_child_face_max_person_height
             ),
+            allow_faceless=getattr(settings, "rv1106_verify_roi_faceless", True),
         )
         if not verification.accepted:
             # 2026-11-04: 板端新模型的 probable 检测框可能指向非人体区域
@@ -622,7 +674,13 @@ async def save_ingested_clip(
                     f"[INGEST] verify reject {key} decision={decision}",
                     flush=True,
                 )
-                spool.remove(job_dir)
+                if getattr(settings, "rv1106_keep_rejected", False):
+                    spool.archive_rejected(job_dir, decision, meta)
+                    spool.prune_rejected(
+                        int(getattr(settings, "rv1106_rejected_retention_days", 7))
+                    )
+                else:
+                    spool.remove(job_dir)
                 return None
             if decision in {"child_face", "daughter_onnx"}:
                 child_evidence = 1.0

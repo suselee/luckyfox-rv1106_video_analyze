@@ -364,6 +364,7 @@ class DaughterDetector:
         max_person_height_limit: float = 0.0,
         required_child_face_frames: int = 1,
         child_face_enabled: bool = True,
+        allow_faceless: bool = True,
         board_box_height: float = 0.0,
         child_face_max_board_height: float = 0.0,
         faceless_max_board_height: float = 0.0,
@@ -452,7 +453,8 @@ class DaughterDetector:
             decision = "face_without_child"
             reason = "repeated face evidence without child evidence"
         elif (
-            face_frames == 0
+            allow_faceless
+            and face_frames == 0
             and person_frames >= required_people
             and board_score >= board_score_threshold
             and board_person_score >= board_person_score_threshold
