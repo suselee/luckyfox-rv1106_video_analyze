@@ -436,6 +436,8 @@ int main(int argc, char* argv[]) {
     // 漏帧。正常解码在 1fps 抽样下每秒都有帧, 60s 无帧即可判定楔死,
     // 把单次盲区从 180s 压到 60s。
     const double NODECODE_REBUILD_SECONDS = 60.0;
+    // 有字节但一直没有关键帧时, 等多久就放弃这条连接 (重建 RTSP 换取新 IDR)。
+    const double NODECODE_NOIDR_EXIT_SECONDS = 120.0;
     const int NODECODE_REBUILD_LIMIT = 2;
 
     SystemMonitor monitor;
@@ -751,10 +753,18 @@ int main(int argc, char* argv[]) {
             // 停摆期间若根本没收到新的 IDR, 就不是解码器卡死 (摄像头没发关键帧
             // 或 GOP 过长), 重建没有意义 —— 继续等, 只做节流告警。
             if (session_idrs <= idrs_at_last_frame) {
+                double idle = now_seconds() - last_frame_ts;
                 if (now_seconds() - last_nodecode_log > 60.0) {
                     last_nodecode_log = now_seconds();
                     printf("[DIAG] no frame %.0fs but no new IDR (feeds=%ld idrs=%ld); waiting\n",
-                           now_seconds() - last_frame_ts, session_feeds, session_idrs);
+                           idle, session_feeds, session_idrs);
+                }
+                // 迟迟等不到 IDR 说明这条连接已经废了 (摄像头停发关键帧 / 码流
+                // 结构异常)。干等会永久假死, 超过阈值就退出, 交给 supervisor
+                // 重建 RTSP 连接 —— 新连接必然带 SPS/PPS/IDR。
+                if (idle > NODECODE_NOIDR_EXIT_SECONDS) {
+                    printf("[DIAG] no IDR for %.0fs; exiting for supervisor restart\n", idle);
+                    break;
                 }
                 sleep(1);
                 continue;
