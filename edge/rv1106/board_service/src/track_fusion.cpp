@@ -34,12 +34,15 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         // 低置信度检出直接忽略: 不建轨迹、不刷新已有轨迹
         if (config_.person_min_score > 0 && person.score < config_.person_min_score)
             continue;
-        // 画面底边的小框 = 镜头脚下的杂物 (地垫边缘/桌腿/玩具), 不可能是人:
-        // 真人站在底边时框高必然很大, 远处的女儿则落在画面中部。
-        // 实测误报框 (26x52px, y2=0.994) 正是这样被当成儿童并升 probable 的。
+        // 画面贴边的小框 = 杂物误检, 不可能是人:
+        //  - 底边 (y2>=0.97): 镜头脚下的地垫边缘/桌腿/玩具, 真人站那里框必然很大;
+        //  - 顶边 (y1<=0.03): 晾衣绳/窗帘/窗框, 真人即使头部被裁, 身体也会向下延展;
+        //    只有半个身子的小框在几何上不可能。
+        // 实测两类都出现过: 26x52px 贴底 (070547)、23x64px 贴顶 (今天 10:05 的误报)。
         {
             float bh = person.y2 - person.y1;
             if (person.y2 >= 0.97f && bh < 0.30f) continue;
+            if (person.y1 <= 0.03f && bh < 0.30f) continue;
         }
         Track* selected = NULL;
         float best_match = -1e9f;

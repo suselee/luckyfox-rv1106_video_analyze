@@ -431,13 +431,13 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
             "RV1106_VERIFY_FALLBACK_PERSON_FRAMES", 4
         ),
         rv1106_verify_fallback_max_person_height=_float(
-            "RV1106_VERIFY_FALLBACK_MAX_PERSON_HEIGHT", 0.45
+            "RV1106_VERIFY_FALLBACK_MAX_PERSON_HEIGHT", 0.40
         ),
         rv1106_verify_child_face_frames=_int(
             "RV1106_VERIFY_CHILD_FACE_FRAMES", 2
         ),
         rv1106_verify_child_face_max_person_height=_float(
-            "RV1106_VERIFY_CHILD_FACE_MAX_PERSON_HEIGHT", 0.45
+            "RV1106_VERIFY_CHILD_FACE_MAX_PERSON_HEIGHT", 0.40
         ),
     )
 

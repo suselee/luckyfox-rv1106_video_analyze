@@ -364,6 +364,26 @@ int main() {
         assert(bottom.active_tracks() == 0);
     }
 
+    // 贴顶小框回归: 晾衣绳/窗框被误检成 23x64px (y1=0.000, 高 0.178),
+    // 高度落在儿童区间, 旧逻辑会判成儿童并升 probable (今天 10:05 的误报)。
+    {
+        FusionConfig tcfg = test_config();
+        tcfg.person_min_score = 0.0f;
+        TrackFusion top(tcfg);
+        for (int i = 0; i < 8; ++i) {
+            IvaResult r;
+            IvaObject junk = {};
+            junk.id = 1; junk.score = 0.9f;
+            junk.x1 = 0.030f; junk.y1 = 0.000f;
+            junk.x2 = 0.065f; junk.y2 = 0.178f;   // 高 0.178, 贴顶边
+            r.people.push_back(junk);
+            top.observe((double)i, r);
+            assert(top.collect_events((double)i).empty());
+        }
+        assert(top.probable_tracks() == 0);
+        assert(top.active_tracks() == 0);
+    }
+
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;
 }
