@@ -24,6 +24,7 @@
 #include "mqtt_publisher.h"
 #include "rockiva_detector.h"
 #include "yolo_detector.h"
+#include "au_assembler.h"
 #include "schedule.h"
 #include "system_monitor.h"
 #include "track_fusion.h"
@@ -316,6 +317,7 @@ int main(int argc, char* argv[]) {
     // 本机实测 RockIVA 在客厅逆光/远景下 person 召回仅 ~8%, YOLOv5 离线 65-96%。
     // yolov5 模式下仍保留 RockIVA 只取人脸框 (人体框丢弃), 避免影响身份识别路径。
     std::string person_detector = cfg.get("pipeline.person_detector", "rockiva");
+    AuAssembler au;                     // IDR-only 模式下的 AU 切分器
     YoloPersonDetector yolo;
     bool yolo_enabled = false;
     if (pipeline_mode == "fusion" && person_detector == "yolov5") {
@@ -516,6 +518,7 @@ int main(int argc, char* argv[]) {
                 // ffmpeg-low 写端 SIGPIPE 死亡并触发整条管线重启循环。
                 // 只释放 NPU 解码器省功耗; 码流留在管道里形成背压暂停。
                 decoder.deinit();
+                au.reset();
                 stream_active = false;
                 reconnect_wait = 2;
                 last_health = -1e9;
@@ -780,22 +783,48 @@ int main(int argc, char* argv[]) {
                    now_seconds() - last_frame_ts,
                    nodecode_rebuilds, NODECODE_REBUILD_LIMIT);
             decoder.deinit();
+            au.reset();
             stream_active = false;
             idle_chunk_reads = 0;
             sleep(5);
             continue;
         }
         if (n > 0) {
-            int nal_type = h264_nal_type(chunk.data(), n);
-            // keyframes_only: 关键帧必喂; 中间帧按 1s 节流抽样,
-            // 把有效分析帧率从 GOP(约 0.5fps)提到 ~1fps, 让 person
-            // 扫描/轨迹融合回到全帧时代的节奏, 同时 CPU 只有全帧的 ~1/10。
-            bool feed = !keyframes_only || nal_type == 5 || nal_type == 6 ||
-                        nal_type == 7 || nal_type == 8 || nal_type == 9;
-            if (!feed && keyframes_only && now_seconds() - last_feed_ts >= 1.0) {
-                feed = true;
-                last_feed_ts = now_seconds();
+            if (keyframes_only) {
+                // IDR-only 模式: 按 AU 切分, 只喂完整的 IDR 访问单元。
+                // 旧实现按 read() 块首 NAL 判断, 会送进半帧/孤儿 P 帧,
+                // 参考链断裂后软解实例楔死 (实测每 2-3 小时一次, 每次盲等
+                // 3 分钟)。现在送进去的永远是 SPS+PPS+IDR 自包含单元。
+                std::vector<std::vector<uint8_t>> idr_aus;
+                au.feed(chunk.data(), n, idr_aus);
+                static int au_dbg = 0;
+                for (size_t ai = 0; ai < idr_aus.size() && au_dbg < 8; ++ai, ++au_dbg) {
+                    const std::vector<uint8_t>& a = idr_aus[ai];
+                    size_t sc = (a.size() > 4 && a[2] == 0 && a[3] == 1) ? 4 : 3;
+                    int t0 = a.size() > sc ? (a[sc] & 0x1f) : -1;
+                    int t2 = -1;
+                    for (size_t k = sc + 1; k + 4 < a.size(); ++k) {
+                        if (a[k] == 0 && a[k+1] == 0 && (a[k+2] == 1 || (a[k+2] == 0 && a[k+3] == 1))) {
+                            size_t h = a[k+2] == 1 ? k + 3 : k + 4;
+                            if (h < a.size()) t2 = a[h] & 0x1f;
+                            break;
+                        }
+                    }
+                    printf("[AU] #%d size=%u first=%d second=%d (aus=%llu idr=%llu)\n",
+                           ai, (unsigned)a.size(), t0, t2,
+                           (unsigned long long)au.aus_seen(), (unsigned long long)au.idr_aus());
+                }
+                for (size_t ai = 0; ai < idr_aus.size(); ++ai) {
+                    decoder.send(idr_aus[ai].data(), (int)idr_aus[ai].size(), pts++, true);
+                    session_feeds++;
+                    session_idrs++;      // 每个 AU 都是 IDR, 计数才有意义
+                }
+                if (now_seconds() - last_feed_ts >= 1.0 && !idr_aus.empty())
+                    last_feed_ts = now_seconds();
+                continue;
             }
+            int nal_type = h264_nal_type(chunk.data(), n);
+            bool feed = true;
             if (feed) {
                 decoder.send(chunk.data(), n, pts++, true);
                 session_feeds++;

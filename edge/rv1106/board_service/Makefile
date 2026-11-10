@@ -44,7 +44,8 @@ MAIN_OBJ   = $(SRC)/main.o $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mqtt_publ
              $(SRC)/mpp_decoder.o $(SRC)/rockiva_detector.o $(SRC)/track_fusion.o \
              $(SRC)/system_monitor.o $(SRC)/schedule.o \
              $(SRC)/video_ring.o $(SRC)/http_uploader.o $(SRC)/high_stream.o $(SRC)/nal_stats.o \
-             $(SRC)/audio_ring.o $(SRC)/audio_util.o $(SRC)/yolo_detector.o
+             $(SRC)/audio_ring.o $(SRC)/audio_util.o $(SRC)/yolo_detector.o \
+             $(SRC)/au_assembler.o
 ENROLL_OBJ = $(SRC)/enroll.o
 # 扩底库前的身份过滤工具: 对候选图打分, 只把确认是女儿的样本追加进底库
 FSCORE_OBJ = $(SRC)/face_score.o
