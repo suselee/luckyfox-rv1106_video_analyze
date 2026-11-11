@@ -154,6 +154,11 @@ while true; do
     ff_stdin_pid=$!
     "$BIN" "$CONFIG" < "$STDIN_FIFO" >>"$LOG" 2>&1 &
     child=$!
+    # 立刻刷新数据心跳: daughter_watch 只在 HEALTH(60s) 里写 /tmp/dw_data,
+    # 而 data_stale() 会把"上次运行遗留的旧文件"判成 10 分钟无数据, 于是
+    # 新进程刚起来 15s 就被 supervisor 杀掉 —— 形成"启动即被杀"的死循环。
+    # 先 touch 一次, 让宽限期从本次启动重新计算。
+    touch /tmp/dw_data 2>/dev/null
     run_start=$(date +%s)
     # 监控: 任一 ffmpeg 死亡 -> 杀掉 daughter_watch 触发重启
     monitor_pipeline &
