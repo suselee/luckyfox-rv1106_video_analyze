@@ -1,6 +1,18 @@
 const statusGrid = document.querySelector("#status-grid");
 const momentsContainer = document.querySelector("#moments");
 const refreshButton = document.querySelector("#refresh-button");
+const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
+const unlabeledOnlyCheckbox = document.querySelector("#unlabeled-only");
+const sectionHint = document.querySelector("#section-hint");
+
+const uiState = {
+  tab: "moments",
+  unlabeledOnly: false,
+  health: null,
+  moments: [],
+  rejected: [],
+  rejectedLoaded: false,
+};
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -30,6 +42,19 @@ function formatDate(value) {
   return date.toLocaleString();
 }
 
+function feedbackBadge(label) {
+  if (label === "daughter") {
+    return '<span class="feedback-badge daughter">✓ 是女儿</span>';
+  }
+  if (label === "adult_only") {
+    return '<span class="feedback-badge adult">✗ 纯大人</span>';
+  }
+  if (label === "uncertain") {
+    return '<span class="feedback-badge uncertain">? 不确定</span>';
+  }
+  return "";
+}
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -43,6 +68,7 @@ async function fetchJson(url, options = {}) {
 }
 
 function renderHealth(health) {
+  if (!health) return;
   const latestLow = health.segments.latest_low;
   const latestHigh = health.segments.latest_high;
   const workers = health.workers;
@@ -51,6 +77,10 @@ function renderHealth(health) {
   const highRecorder = workers.recorders?.high || {};
   const mqtt = workers.mqtt || {};
   const rv1106 = workers.rv1106 || {};
+  const feedback = health.feedback || {};
+  const fbLabel = feedback.by_label || {};
+  const fbMoment = feedback.by_source?.moment || {};
+  const fbRejected = feedback.by_source?.rejected || {};
   const highOnly = health.configured.recording_mode === "high_only";
 
   const cards = [
@@ -146,6 +176,13 @@ function renderHealth(health) {
             }`
           : "Waiting for board heartbeat",
     },
+    {
+      label: "Feedback",
+      value: `${feedback.total || 0} labeled`,
+      meta: `女儿 ${fbLabel.daughter || 0} · 纯大人 ${fbLabel.adult_only || 0} (删片 ${
+        fbMoment.deleted || 0
+      }) · 被拒漏检 ${fbRejected.daughter || 0}`,
+    },
   ];
 
   statusGrid.innerHTML = cards
@@ -162,23 +199,48 @@ function renderHealth(health) {
 }
 
 function renderMoments(moments) {
-  if (!moments.length) {
+  const visible = uiState.unlabeledOnly
+    ? moments.filter((moment) => !moment.feedback_label)
+    : moments;
+
+  if (!visible.length) {
     momentsContainer.innerHTML = `
       <div class="empty-state">
-        <h3>No saved moments yet</h3>
-        <p>After RTSP and an analysis backend are configured, selected clips will appear here automatically.</p>
+        <h3>${uiState.unlabeledOnly && moments.length ? "All saved moments labeled" : "No saved moments yet"}</h3>
+        <p>${
+          uiState.unlabeledOnly && moments.length
+            ? "Uncheck 'Unlabeled only' to view previously reviewed moments."
+            : "After RTSP and an analysis backend are configured, selected clips will appear here automatically."
+        }</p>
       </div>
     `;
     return;
   }
 
-  momentsContainer.innerHTML = moments
+  momentsContainer.innerHTML = visible
     .map((moment) => {
       const tags = (moment.tags || [])
         .map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`)
         .join("");
+      const badge = feedbackBadge(moment.feedback_label);
+      const isDaughter = moment.feedback_label === "daughter";
+      const previewUrl = moment.preview_url || `/api/moments/${moment.id}/preview.jpg`;
       return `
-        <article class="moment-card" data-id="${moment.id}" data-favorited="${moment.favorited}">
+        <article
+          class="moment-card ${moment.feedback_label ? `labeled-${escapeHtml(moment.feedback_label)}` : ""}"
+          data-source="moment"
+          data-id="${moment.id}"
+          data-favorited="${moment.favorited}"
+        >
+          <div class="preview-wrap">
+            <img
+              class="moment-preview"
+              src="${escapeHtml(previewUrl)}"
+              alt="${escapeHtml(moment.title)}"
+              loading="lazy"
+            />
+            ${badge}
+          </div>
           <div class="moment-body">
             <div class="moment-title-row">
               <h3>${escapeHtml(moment.title)}</h3>
@@ -190,6 +252,16 @@ function renderMoments(moments) {
               <span>${escapeHtml(formatDate(moment.source_started_at))}</span>
               <span>${escapeHtml(moment.camera_name)}</span>
               <span>${escapeHtml(moment.category || moment.analysis_backend || "vlm")}</span>
+            </div>
+            <div class="feedback-actions">
+              <button
+                class="button feedback-btn ${isDaughter ? "active-daughter" : "secondary"}"
+                data-action="feedback-daughter"
+              >✓ 是女儿</button>
+              <button
+                class="button feedback-btn danger"
+                data-action="feedback-adult-delete"
+              >✗ 纯大人·删片</button>
             </div>
             <div class="actions">
               <a class="button secondary" href="${moment.download_url}" download>Download clip</a>
@@ -205,41 +277,241 @@ function renderMoments(moments) {
     .join("");
 }
 
+function renderRejected(items) {
+  const visible = uiState.unlabeledOnly
+    ? items.filter((item) => !item.feedback_label)
+    : items;
+
+  if (!visible.length) {
+    momentsContainer.innerHTML = `
+      <div class="empty-state">
+        <h3>${uiState.unlabeledOnly && items.length ? "All rejected clips labeled" : "No rejected clips archived"}</h3>
+        <p>${
+          uiState.unlabeledOnly && items.length
+            ? "Uncheck 'Unlabeled only' to review already labeled clips."
+            : "Rejected probable clips appear here when RV1106_KEEP_REJECTED=true."
+        }</p>
+      </div>
+    `;
+    return;
+  }
+
+  momentsContainer.innerHTML = visible
+    .map((item) => {
+      const badge = feedbackBadge(item.feedback_label);
+      const label = item.feedback_label || "";
+      return `
+        <article
+          class="moment-card ${label ? `labeled-${escapeHtml(label)}` : ""}"
+          data-source="rejected"
+          data-name="${escapeHtml(item.name)}"
+        >
+          <div class="preview-wrap">
+            <img
+              class="moment-preview"
+              src="${escapeHtml(item.preview_url)}"
+              alt="${escapeHtml(item.decision)}"
+              loading="lazy"
+            />
+            ${badge}
+          </div>
+          <div class="moment-body">
+            <div class="moment-title-row">
+              <h3>${escapeHtml(item.decision)}</h3>
+              <span class="confidence">${Math.round((item.score || 0) * 100)}%</span>
+            </div>
+            <div class="moment-meta">
+              <span>${escapeHtml(formatDate(item.archived_at))}</span>
+              <span>${escapeHtml(item.identity || "probable")}</span>
+              <span>${escapeHtml(item.name)}</span>
+            </div>
+            <div class="feedback-actions">
+              <button
+                class="button feedback-btn ${label === "daughter" ? "active-daughter" : "secondary"}"
+                data-action="rejected-daughter"
+              >✓ 漏检(是女儿)</button>
+              <button
+                class="button feedback-btn ${label === "adult_only" ? "active-adult" : "danger"}"
+                data-action="rejected-adult"
+              >✗ 确实纯大人</button>
+              <button
+                class="button feedback-btn ${label === "uncertain" ? "active-uncertain" : "secondary"}"
+                data-action="rejected-uncertain"
+              >? 不确定</button>
+            </div>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderActiveTab() {
+  for (const btn of tabButtons) {
+    const active = btn.dataset.tab === uiState.tab;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  if (sectionHint) {
+    sectionHint.textContent =
+      uiState.tab === "moments"
+        ? "Automatically saved 4K clips. Review previews, tag daughter / adult-only, or download for VLC."
+        : "Rejected probable clips archived on NAS. Label missed daughter clips vs true adult-only rejections.";
+  }
+  if (uiState.tab === "moments") {
+    renderMoments(uiState.moments);
+  } else {
+    renderRejected(uiState.rejected);
+  }
+}
+
 async function loadAll() {
   refreshButton.disabled = true;
   try {
-    const [health, moments] = await Promise.all([
+    const requests = [
       fetchJson("/api/health"),
       fetchJson("/api/moments"),
-    ]);
-    renderHealth(health);
-    renderMoments(moments.moments || []);
+    ];
+    if (uiState.tab === "rejected" || uiState.rejectedLoaded) {
+      requests.push(fetchJson("/api/rejected?limit=60"));
+    }
+    const [health, moments, rejected] = await Promise.all(requests);
+    uiState.health = health;
+    uiState.moments = moments.moments || [];
+    if (rejected) {
+      uiState.rejected = rejected.rejected || [];
+      uiState.rejectedLoaded = true;
+    }
+    renderHealth(uiState.health);
+    renderActiveTab();
   } finally {
     refreshButton.disabled = false;
   }
 }
 
+async function switchTab(tab) {
+  uiState.tab = tab;
+  if (tab === "rejected" && !uiState.rejectedLoaded) {
+    momentsContainer.innerHTML = '<div class="empty-state"><h3>Loading rejected clips…</h3></div>';
+    const data = await fetchJson("/api/rejected?limit=60");
+    uiState.rejected = data.rejected || [];
+    uiState.rejectedLoaded = true;
+  }
+  renderActiveTab();
+}
+
+for (const btn of tabButtons) {
+  btn.addEventListener("click", () => {
+    switchTab(btn.dataset.tab).catch((error) => {
+      momentsContainer.innerHTML = `<div class="empty-state"><h3>Load failed</h3><p>${escapeHtml(
+        error.message,
+      )}</p></div>`;
+    });
+  });
+}
+
+if (unlabeledOnlyCheckbox) {
+  unlabeledOnlyCheckbox.addEventListener("change", () => {
+    uiState.unlabeledOnly = Boolean(unlabeledOnlyCheckbox.checked);
+    renderActiveTab();
+  });
+}
+
+momentsContainer.addEventListener(
+  "error",
+  (event) => {
+    if (event.target && event.target.classList?.contains("moment-preview")) {
+      event.target.classList.add("preview-broken");
+    }
+  },
+  true,
+);
+
 momentsContainer.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   const card = button.closest(".moment-card");
-  const id = card.dataset.id;
+  if (!card) return;
   const action = button.dataset.action;
 
-  if (action === "favorite") {
-    const favorited = card.dataset.favorited !== "true";
-    await fetchJson(`/api/moments/${id}/favorite`, {
-      method: "POST",
-      body: JSON.stringify({ favorited }),
-    });
-    await loadAll();
-  }
+  button.disabled = true;
+  try {
+    if (card.dataset.source === "rejected") {
+      const name = card.dataset.name;
+      const labelMap = {
+        "rejected-daughter": "daughter",
+        "rejected-adult": "adult_only",
+        "rejected-uncertain": "uncertain",
+      };
+      const label = labelMap[action];
+      if (!label) return;
+      const res = await fetchJson(`/api/rejected/${encodeURIComponent(name)}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ label }),
+      });
+      const target = uiState.rejected.find((item) => item.name === name);
+      if (target) target.feedback_label = label;
+      if (uiState.health && res.summary) {
+        uiState.health.feedback = res.summary;
+        renderHealth(uiState.health);
+      }
+      renderActiveTab();
+      return;
+    }
 
-  if (action === "delete") {
-    const confirmed = window.confirm("Delete this saved clip and metadata?");
-    if (!confirmed) return;
-    await fetchJson(`/api/moments/${id}`, { method: "DELETE" });
-    await loadAll();
+    const id = Number(card.dataset.id);
+    if (action === "feedback-daughter") {
+      const res = await fetchJson(`/api/moments/${id}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ label: "daughter", delete_clip: false }),
+      });
+      const target = uiState.moments.find((item) => item.id === id);
+      if (target) target.feedback_label = "daughter";
+      if (uiState.health && res.summary) {
+        uiState.health.feedback = res.summary;
+        renderHealth(uiState.health);
+      }
+      renderActiveTab();
+      return;
+    }
+
+    if (action === "feedback-adult-delete") {
+      const confirmed = window.confirm(
+        "确认标记为「纯大人」并删除该片段？（原片会转存至被拒样本库用于后续优化）",
+      );
+      if (!confirmed) return;
+      const res = await fetchJson(`/api/moments/${id}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ label: "adult_only", delete_clip: true }),
+      });
+      uiState.moments = uiState.moments.filter((item) => item.id !== id);
+      uiState.rejectedLoaded = false;
+      if (uiState.health && res.summary) {
+        uiState.health.feedback = res.summary;
+        renderHealth(uiState.health);
+      }
+      renderActiveTab();
+      return;
+    }
+
+    if (action === "favorite") {
+      const favorited = card.dataset.favorited !== "true";
+      await fetchJson(`/api/moments/${id}/favorite`, {
+        method: "POST",
+        body: JSON.stringify({ favorited }),
+      });
+      await loadAll();
+      return;
+    }
+
+    if (action === "delete") {
+      const confirmed = window.confirm("Delete this saved clip and metadata?");
+      if (!confirmed) return;
+      await fetchJson(`/api/moments/${id}`, { method: "DELETE" });
+      await loadAll();
+    }
+  } finally {
+    button.disabled = false;
   }
 });
 

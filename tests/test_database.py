@@ -387,3 +387,84 @@ def test_stale_board_session_is_finalized_with_configurable_cutoff(tmp_path):
     assert database.finalize_stale_board_sessions(104.0) == 0
     assert database.finalize_stale_board_sessions(105.0) == 1
     assert database.pending_board_sessions()[0]["status"] == "ready"
+
+
+def test_clip_feedback_upsert_survives_moment_deletion_and_summarizes(tmp_path):
+    import pytest
+
+    database = Database(tmp_path / "feedback.sqlite3")
+    database.migrate()
+    moment_id = database.create_moment(
+        camera_name="home-camera",
+        title="Playing",
+        summary="",
+        tags=["daughter"],
+        confidence=0.88,
+        source_low_segment_id=None,
+        source_started_at="2026-11-26T10:00:00+08:00",
+        source_ended_at="2026-11-26T10:00:25+08:00",
+        clip_path=tmp_path / "2026-11-26" / "100000_playing.mp4",
+        metadata_path=tmp_path / "2026-11-26" / "100000_playing.json",
+        category="rv1106_probable",
+        trigger_key="ev-123",
+    )
+
+    row = database.upsert_clip_feedback(
+        source="moment",
+        item_key="moment:ev-123",
+        label="daughter",
+        moment_id=moment_id,
+        clip_path=str(tmp_path / "2026-11-26" / "100000_playing.mp4"),
+        meta={"best_ts": 100.0},
+        day="2026-11-26",
+        category="rv1106_probable",
+    )
+    assert row["label"] == "daughter"
+    assert row["deleted_clip"] is False
+    assert row["meta"] == {"best_ts": 100.0}
+
+    # Re-label as adult_only + deleted, then delete moment row -> feedback persists
+    updated = database.upsert_clip_feedback(
+        source="moment",
+        item_key="moment:ev-123",
+        label="adult_only",
+        moment_id=moment_id,
+        deleted_clip=True,
+        clip_path=str(tmp_path / "rejected" / "fp.mp4"),
+    )
+    assert updated["label"] == "adult_only"
+    assert updated["deleted_clip"] is True
+    assert updated["meta"] == {"best_ts": 100.0}
+
+    database.delete_moment_record(moment_id)
+    fb_map = database.get_feedback_map(["moment:ev-123", "rejected:missing"])
+    assert fb_map["moment:ev-123"]["label"] == "adult_only"
+    assert fb_map["moment:ev-123"]["deleted_clip"] is True
+    assert "rejected:missing" not in fb_map
+
+    database.upsert_clip_feedback(
+        source="rejected",
+        item_key="rejected:20261126-100000_abc",
+        label="daughter",
+        clip_path=str(tmp_path / "rejected" / "20261126-100000_abc" / "clip.hevc"),
+        category="no_person",
+    )
+    database.upsert_clip_feedback(
+        source="rejected",
+        item_key="rejected:20261126-100100_def",
+        label="uncertain",
+        category="inconclusive",
+    )
+
+    summary = database.feedback_summary()
+    assert summary["total"] == 3
+    assert summary["by_label"] == {"daughter": 1, "adult_only": 1, "uncertain": 1}
+    assert summary["by_source"]["moment"]["adult_only"] == 1
+    assert summary["by_source"]["moment"]["deleted"] == 1
+    assert summary["by_source"]["rejected"]["daughter"] == 1
+    assert len(database.list_clip_feedback(label="daughter")) == 1
+
+    with pytest.raises(ValueError):
+        database.upsert_clip_feedback(source="bad", item_key="k", label="daughter")
+    with pytest.raises(ValueError):
+        database.upsert_clip_feedback(source="moment", item_key="k", label="bad")

@@ -2438,6 +2438,7 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "done": database.count_ingested_done(),
             "failed": database.count_pending_ingested_clips(),
         },
+        "feedback": database.feedback_summary(),
         "stream_alignment": (
             supervisor.snapshot().get("stream_alignment", {"status": "unknown"})
             if supervisor

@@ -20,6 +20,18 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+VALID_FEEDBACK_SOURCES = ("moment", "rejected")
+VALID_FEEDBACK_LABELS = ("daughter", "adult_only", "uncertain")
+
+
+def moment_feedback_key(moment: dict[str, Any]) -> str:
+    """Stable key for clip feedback that survives moment deletion."""
+    trigger_key = str(moment.get("trigger_key") or "").strip()
+    if trigger_key:
+        return f"moment:{trigger_key}"
+    return f"moment:{moment['id']}"
+
+
 class Database:
     _BUSY_TIMEOUT_MS = 30_000
 
@@ -145,6 +157,25 @@ class Database:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(moment_id) REFERENCES moments(id) ON DELETE SET NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS clip_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL CHECK (source IN ('moment', 'rejected')),
+                    item_key TEXT NOT NULL UNIQUE,
+                    moment_id INTEGER,
+                    label TEXT NOT NULL CHECK (label IN ('daughter', 'adult_only', 'uncertain')),
+                    deleted_clip INTEGER NOT NULL DEFAULT 0,
+                    clip_path TEXT NOT NULL DEFAULT '',
+                    meta_json TEXT NOT NULL DEFAULT '{}',
+                    day TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(moment_id) REFERENCES moments(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_clip_feedback_label
+                ON clip_feedback(label, updated_at DESC);
                 """
             )
             columns = {
@@ -1092,3 +1123,164 @@ class Database:
                 (limit,),
             ).fetchall()
             return [row_to_dict(row) for row in rows]
+
+    def upsert_clip_feedback(
+        self,
+        *,
+        source: str,
+        item_key: str,
+        label: str,
+        moment_id: int | None = None,
+        deleted_clip: bool = False,
+        clip_path: str = "",
+        meta: dict[str, Any] | None = None,
+        day: str = "",
+        category: str = "",
+    ) -> dict[str, Any]:
+        if source not in VALID_FEEDBACK_SOURCES:
+            raise ValueError(f"invalid feedback source: {source}")
+        if label not in VALID_FEEDBACK_LABELS:
+            raise ValueError(f"invalid feedback label: {label}")
+        now = local_now_iso()
+        meta_json = json.dumps(meta or {}, ensure_ascii=False, sort_keys=True)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO clip_feedback(
+                    source, item_key, moment_id, label, deleted_clip,
+                    clip_path, meta_json, day, category, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_key) DO UPDATE SET
+                    moment_id=COALESCE(excluded.moment_id, clip_feedback.moment_id),
+                    label=excluded.label,
+                    deleted_clip=MAX(clip_feedback.deleted_clip, excluded.deleted_clip),
+                    clip_path=CASE
+                        WHEN excluded.clip_path != '' THEN excluded.clip_path
+                        ELSE clip_feedback.clip_path
+                    END,
+                    meta_json=CASE
+                        WHEN excluded.meta_json != '{}' THEN excluded.meta_json
+                        ELSE clip_feedback.meta_json
+                    END,
+                    day=CASE
+                        WHEN excluded.day != '' THEN excluded.day
+                        ELSE clip_feedback.day
+                    END,
+                    category=CASE
+                        WHEN excluded.category != '' THEN excluded.category
+                        ELSE clip_feedback.category
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    source,
+                    item_key,
+                    moment_id,
+                    label,
+                    1 if deleted_clip else 0,
+                    str(clip_path or ""),
+                    meta_json,
+                    str(day or ""),
+                    str(category or ""),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM clip_feedback WHERE item_key=?",
+                (item_key,),
+            ).fetchone()
+        assert row is not None
+        return self._decode_feedback_row(row)
+
+    @staticmethod
+    def _decode_feedback_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = row_to_dict(row)
+        item["deleted_clip"] = bool(item["deleted_clip"])
+        raw = item.pop("meta_json", "{}")
+        try:
+            item["meta"] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            item["meta"] = {}
+        return item
+
+    def get_feedback_map(self, item_keys: list[str]) -> dict[str, dict[str, Any]]:
+        cleaned = [key for key in item_keys if key]
+        if not cleaned:
+            return {}
+        placeholders = ",".join("?" for _ in cleaned)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT item_key, label, deleted_clip, updated_at FROM clip_feedback "
+                f"WHERE item_key IN ({placeholders})",
+                tuple(cleaned),
+            ).fetchall()
+        return {
+            str(row["item_key"]): {
+                "label": str(row["label"]),
+                "deleted_clip": bool(row["deleted_clip"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        }
+
+    def list_clip_feedback(
+        self,
+        *,
+        limit: int = 200,
+        label: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if label:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM clip_feedback
+                    WHERE label=?
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (label, max(1, limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM clip_feedback
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, limit),),
+                ).fetchall()
+        return [self._decode_feedback_row(row) for row in rows]
+
+    def feedback_summary(self) -> dict[str, Any]:
+        by_label = {label: 0 for label in VALID_FEEDBACK_LABELS}
+        by_source: dict[str, dict[str, int]] = {
+            "moment": {label: 0 for label in VALID_FEEDBACK_LABELS} | {"deleted": 0},
+            "rejected": {label: 0 for label in VALID_FEEDBACK_LABELS},
+        }
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source, label, COUNT(*) AS n, SUM(deleted_clip) AS deleted_n
+                FROM clip_feedback
+                GROUP BY source, label
+                """
+            ).fetchall()
+        total = 0
+        for row in rows:
+            source = str(row["source"])
+            label = str(row["label"])
+            count = int(row["n"] or 0)
+            deleted_count = int(row["deleted_n"] or 0)
+            total += count
+            if label in by_label:
+                by_label[label] += count
+            if source in by_source and label in by_source[source]:
+                by_source[source][label] += count
+            if source == "moment":
+                by_source["moment"]["deleted"] += deleted_count
+        return {
+            "total": total,
+            "by_label": by_label,
+            "by_source": by_source,
+        }
