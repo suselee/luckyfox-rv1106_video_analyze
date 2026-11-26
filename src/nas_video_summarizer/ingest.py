@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
+import math
 import os
 import re
 import shutil
+import statistics
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -433,57 +435,60 @@ def _moment_period(
     return None
 
 
-def _board_box_height(meta: dict[str, Any]) -> float:
-    """板端上传 meta 里的人体框高度 (归一化, 全帧坐标系)。
-
-    板端 box/best_box 语义为 (x1, y1, x2, y2); 若数值 > 1.5 视为像素坐标,
-    用 frame_height 归一化。无法解析时返回 0.0 (闸门不生效)。
-    """
-    raw = meta.get("best_box") or meta.get("box")
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+def _box_height(raw_box: Any, *, frame_height: float = 0.0) -> float:
+    """单个板端人体框的归一化高度 (全帧坐标系); 无法解析时返回 0.0。"""
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
         return 0.0
     try:
-        x1, y1, x2, y2 = (float(v) for v in raw)
+        x1, y1, x2, y2 = (float(v) for v in raw_box)
     except (TypeError, ValueError):
         return 0.0
     height = y2 - y1
     if height <= 0:
         return 0.0
     if max(abs(x1), abs(y1), abs(x2), abs(y2)) > 1.5:
-        frame_height = float(meta.get("frame_height") or 0)
         if frame_height <= 0:
             return 0.0
         height /= frame_height
     return min(1.0, height)
 
 
-def _normalized_board_roi(
-    meta: dict[str, Any],
+def _board_box_height(meta: dict[str, Any]) -> float:
+    """板端上传 meta 里的人体框高度 (归一化, 全帧坐标系)。
+
+    板端 box/best_box 语义为 (x1, y1, x2, y2); 若数值 > 1.5 视为像素坐标,
+    用 frame_height 归一化。无法解析时返回 0.0 (闸门不生效)。
+    """
+    return _box_height(
+        meta.get("best_box") or meta.get("box"),
+        frame_height=float(meta.get("frame_height") or 0),
+    )
+
+
+def _box_to_normalized_roi(
+    raw_box: Any,
     *,
     width_scale: float,
     height_scale: float,
+    frame_width: float = 0.0,
+    frame_height: float = 0.0,
 ) -> tuple[float, float, float, float] | None:
-    """把板端人物框映射为裁剪用的归一化扩展 ROI。
+    """把单个板端框映射为裁剪用的归一化扩展 ROI (left, top, width, height)。
 
-    板端 best_box / box 的归一化语义是 (x1, y1, x2, y2);
+    板端 best_box / box / track_samples 归一化语义为 (x1, y1, x2, y2);
     MQTT 会话 payload 为像素值 (配 frame_width/frame_height)。
-
-    2026-11-04 修正: 旧实现把归一化框按 (x, y, w, h) 解释, 导致 74% 的
-    历史框"越界"(x+w > 1), ROI 中心向右下偏移且尺寸被放大 3~6 倍,
-    裁剪框经常框不到人, 表现为 no_person 大量误拒。
     """
-    raw_box = meta.get("best_box") or meta.get("box")
     if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
         return None
     try:
         raw = [float(value) for value in raw_box]
     except (TypeError, ValueError):
         return None
+    if not all(math.isfinite(value) for value in raw):
+        return None
 
     if max(raw[0], raw[2]) > 1.5 or max(raw[1], raw[3]) > 1.5:
         # 像素坐标 (x1, y1, x2, y2): 归一化需要帧宽高
-        frame_width = float(meta.get("frame_width") or 0)
-        frame_height = float(meta.get("frame_height") or 0)
         if frame_width <= 0 or frame_height <= 0:
             return None
         x1 = raw[0] / frame_width
@@ -513,6 +518,211 @@ def _normalized_board_roi(
     if roi_right <= roi_left or roi_bottom <= roi_top:
         return None
     return roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top
+
+
+def _normalized_board_roi(
+    meta: dict[str, Any],
+    *,
+    width_scale: float,
+    height_scale: float,
+) -> tuple[float, float, float, float] | None:
+    """把板端人物框映射为裁剪用的归一化扩展 ROI。
+
+    2026-11-04 修正: 旧实现把归一化框按 (x, y, w, h) 解释, 导致 74% 的
+    历史框"越界"(x+w > 1), ROI 中心向右下偏移且尺寸被放大 3~6 倍,
+    裁剪框经常框不到人, 表现为 no_person 大量误拒。
+    """
+    return _box_to_normalized_roi(
+        meta.get("best_box") or meta.get("box"),
+        width_scale=width_scale,
+        height_scale=height_scale,
+        frame_width=float(meta.get("frame_width") or 0),
+        frame_height=float(meta.get("frame_height") or 0),
+    )
+
+
+@dataclass(frozen=True)
+class _VerifyTarget:
+    offset_seconds: float
+    roi: tuple[float, float, float, float]
+    box_height: float
+
+
+def _spaced_offsets(start: float, end: float, count: int) -> list[float]:
+    if count <= 1 or end <= start:
+        return [start]
+    step = (end - start) / (count - 1)
+    return [start + step * index for index in range(count)]
+
+
+def _anchored_window(
+    anchor: float,
+    width: float,
+    min_off: float,
+    max_off: float,
+) -> tuple[float, float]:
+    """围绕 anchor 构造宽度为 width 的抽帧窗, 越界时整体平移而非单端截断重复。"""
+    span = min(max(0.0, width), max(0.0, max_off - min_off))
+    lo = anchor - span / 2.0
+    hi = anchor + span / 2.0
+    if lo < min_off:
+        lo = min_off
+        hi = min(max_off, lo + span)
+    if hi > max_off:
+        hi = max_off
+        lo = max(min_off, hi - span)
+    return lo, hi
+
+
+def _parse_track_samples(
+    meta: dict[str, Any],
+    *,
+    origin_ts: float,
+    end_ts: float,
+    width_scale: float,
+    height_scale: float,
+) -> list[tuple[float, tuple[float, float, float, float], float]]:
+    """解析板端上传的稀疏轨迹点 track_samples: [[ts, x1, y1, x2, y2], ...]。"""
+    raw_samples = meta.get("track_samples")
+    if not isinstance(raw_samples, list) or not raw_samples:
+        return []
+    frame_width = float(meta.get("frame_width") or 0)
+    frame_height = float(meta.get("frame_height") or 0)
+    parsed: list[tuple[float, tuple[float, float, float, float], float]] = []
+    for item in raw_samples:
+        if isinstance(item, (list, tuple)) and len(item) == 5:
+            raw_ts, raw_box = item[0], item[1:5]
+        elif isinstance(item, dict):
+            raw_ts, raw_box = item.get("ts"), item.get("box")
+        else:
+            continue
+        try:
+            ts = float(raw_ts)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(ts) or ts < origin_ts - 0.5 or ts > end_ts + 0.5:
+            continue
+        roi = _box_to_normalized_roi(
+            raw_box,
+            width_scale=width_scale,
+            height_scale=height_scale,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if roi is None:
+            continue
+        height = _box_height(raw_box, frame_height=frame_height)
+        parsed.append((ts, roi, height))
+    parsed.sort(key=lambda entry: entry[0])
+    return parsed
+
+
+def _plan_verify_targets(
+    meta: dict[str, Any],
+    *,
+    width_scale: float,
+    height_scale: float,
+    sample_count: int = 5,
+    anchor_window_seconds: float = 6.0,
+) -> tuple[list[_VerifyTarget], str | None]:
+    """规划 probable 校验的 (抽帧偏移, 对应 ROI, 框高) 列表。
+
+    优先级:
+      1. 板端携带 eff_start/eff_end 时以实际关键帧起点作为 0s 原点, 消除 GOP 回溯漂移;
+      2. 若存在落在切片窗内的 track_samples, 逐帧绑定对应时刻的 ROI (时空对齐);
+      3. 否则围绕 best_ts / activity_peak_ts / last_active_ts 在 ±3s 窗口内抽帧,
+         避免 context_before=20s 导致的早期空场景误抽; 均不可用时退回均匀抽帧。
+    """
+    clip_start = float(meta.get("clip_start") or 0.0)
+    clip_end = float(meta.get("clip_end") or 0.0)
+    eff_start = float(meta.get("eff_start") or 0.0)
+    eff_end = float(meta.get("eff_end") or 0.0)
+    if (
+        math.isfinite(eff_start)
+        and math.isfinite(eff_end)
+        and eff_start > 0.0
+        and eff_end > eff_start
+    ):
+        origin_ts, end_ts = eff_start, eff_end
+    else:
+        origin_ts, end_ts = clip_start, clip_end
+    duration = max(0.0, end_ts - origin_ts)
+
+    fallback_roi = _normalized_board_roi(
+        meta,
+        width_scale=width_scale,
+        height_scale=height_scale,
+    )
+    samples = (
+        _parse_track_samples(
+            meta,
+            origin_ts=origin_ts,
+            end_ts=end_ts,
+            width_scale=width_scale,
+            height_scale=height_scale,
+        )
+        if duration > 0
+        else []
+    )
+    if not samples and fallback_roi is None:
+        return [], "invalid_roi_fallback"
+    if duration <= 0:
+        return [], "invalid_duration_fallback"
+
+    margin = min(0.5, duration * 0.05)
+    min_off = margin
+    max_off = max(margin, duration - margin)
+
+    if samples:
+        if len(samples) >= sample_count:
+            targets: list[_VerifyTarget] = []
+            for index in range(sample_count):
+                sample_idx = round(
+                    index * (len(samples) - 1) / max(1, sample_count - 1)
+                )
+                ts, roi, height = samples[sample_idx]
+                off = min(max_off, max(min_off, ts - origin_ts))
+                targets.append(_VerifyTarget(off, roi, height))
+            return targets, None
+        lo_s = samples[0][0] - origin_ts
+        hi_s = samples[-1][0] - origin_ts
+        if hi_s - lo_s < anchor_window_seconds:
+            win_lo, win_hi = _anchored_window(
+                (lo_s + hi_s) / 2.0, anchor_window_seconds, min_off, max_off
+            )
+        else:
+            win_lo = min(max_off, max(min_off, lo_s))
+            win_hi = min(max_off, max(win_lo, hi_s))
+        offsets = _spaced_offsets(win_lo, win_hi, sample_count)
+        targets = []
+        for off in offsets:
+            nearest = min(samples, key=lambda entry: abs((entry[0] - origin_ts) - off))
+            targets.append(_VerifyTarget(off, nearest[1], nearest[2]))
+        return targets, None
+
+    assert fallback_roi is not None
+    fallback_height = _board_box_height(meta)
+    anchor_ts: float | None = None
+    for key in ("best_ts", "activity_peak_ts", "last_active_ts"):
+        raw_val = meta.get(key)
+        if raw_val is None:
+            continue
+        try:
+            candidate = float(raw_val)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate) and origin_ts <= candidate <= end_ts:
+            anchor_ts = candidate
+            break
+
+    if anchor_ts is not None:
+        win_lo, win_hi = _anchored_window(
+            anchor_ts - origin_ts, anchor_window_seconds, min_off, max_off
+        )
+        offsets = _spaced_offsets(win_lo, win_hi, sample_count)
+    else:
+        offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
+    return [_VerifyTarget(off, fallback_roi, fallback_height) for off in offsets], None
 
 
 async def _remux_with_audio_fallback(
@@ -568,21 +778,21 @@ async def _verify_probable_clip(
 
     上传物是裸 Annex-B 基本流 (无容器时间戳), ffmpeg -ss 输入侧寻址
     对其无效 —— 若调用方未提供已重封装的 mp4_path 且源非 .mp4, 先零拷贝
-    重封装为 MP4, 再按轨迹 ROI 均匀抽 5 帧 (单次解码同时产出 ROI 裁切帧
-    与整帧, 回退无需二次启动 ffmpeg)。返回 (accepted, decision, verification)。
+    重封装为 MP4, 再按时空对齐的轨迹 ROI (或 best_ts/activity_peak_ts
+    锚定窗口) 抽 5 帧 (单次解码同时产出 ROI 裁切帧与整帧, 回退无需二次
+    启动 ffmpeg)。返回 (accepted, decision, verification)。
     """
-    roi = _normalized_board_roi(
+    targets, plan_fallback = _plan_verify_targets(
         meta,
         width_scale=settings.rv1106_verify_roi_width_scale,
         height_scale=settings.rv1106_verify_roi_height_scale,
     )
-    if roi is None:
-        return True, "invalid_roi_fallback", None
-    clip_start = float(meta.get("clip_start") or 0.0)
-    clip_end = float(meta.get("clip_end") or 0.0)
-    duration = max(0.0, clip_end - clip_start)
-    if duration <= 0:
-        return True, "invalid_duration_fallback", None
+    if plan_fallback is not None:
+        return True, plan_fallback, None
+    heights = [target.box_height for target in targets if target.box_height > 0.0]
+    board_box_height = (
+        statistics.median(heights) if heights else _board_box_height(meta)
+    )
     with tempfile.TemporaryDirectory(prefix="nas-video-clip-verify-") as temp_dir:
         if mp4_path is not None:
             source_mp4 = mp4_path
@@ -602,11 +812,10 @@ async def _verify_probable_clip(
                 return True, "remux_failed_fallback", None
         if not source_mp4.exists() or source_mp4.stat().st_size == 0:
             return True, "empty_remux_fallback", None
-        offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
         frames: list[Path] = []
         full_frames_cached: list[Path] = []
         use_dual_extract = extract_cropped_frame is _DEFAULT_EXTRACT_CROPPED_FRAME
-        for index, offset in enumerate(offsets, start=1):
+        for index, target in enumerate(targets, start=1):
             roi_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
             full_path = Path(temp_dir) / f"clip-full-{index}.jpg"
             if use_dual_extract:
@@ -615,8 +824,8 @@ async def _verify_probable_clip(
                     source_mp4,
                     roi_path,
                     full_path,
-                    offset,
-                    roi=roi,
+                    target.offset_seconds,
+                    roi=target.roi,
                     output_width=settings.rv1106_verify_frame_width,
                 )
                 if full_path.exists():
@@ -626,8 +835,8 @@ async def _verify_probable_clip(
                     settings,
                     source_mp4,
                     roi_path,
-                    offset,
-                    roi=roi,
+                    target.offset_seconds,
+                    roi=target.roi,
                     output_width=settings.rv1106_verify_frame_width,
                 )
             if roi_path.exists():
@@ -647,7 +856,7 @@ async def _verify_probable_clip(
             ),
             child_face_enabled=settings.rv1106_verify_child_face_enabled,
             required_child_face_frames=settings.rv1106_verify_child_face_frames,
-            board_box_height=_board_box_height(meta),
+            board_box_height=board_box_height,
             child_face_max_board_height=(
                 settings.rv1106_verify_child_face_max_person_height
             ),
@@ -663,13 +872,13 @@ async def _verify_probable_clip(
             # 不可靠而把真实在场景内的片段全部丢弃。
             full_frames = full_frames_cached
             if not full_frames:
-                for index, offset in enumerate(offsets, start=1):
+                for index, target in enumerate(targets, start=1):
                     frame_path = Path(temp_dir) / f"clip-full-{index}.jpg"
                     await extract_cropped_frame(
                         settings,
                         source_mp4,
                         frame_path,
-                        offset,
+                        target.offset_seconds,
                         roi=(0.0, 0.0, 1.0, 1.0),
                         output_width=settings.rv1106_verify_frame_width,
                     )
@@ -708,7 +917,7 @@ async def _verify_probable_clip(
                     required_child_face_frames=(
                         settings.rv1106_verify_child_face_frames
                     ),
-                    board_box_height=_board_box_height(meta),
+                    board_box_height=board_box_height,
                     child_face_max_board_height=(
                         settings.rv1106_verify_child_face_max_person_height
                     ),

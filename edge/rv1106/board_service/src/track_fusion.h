@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -13,6 +14,16 @@ enum IdentityLevel {
     IDENTITY_UNKNOWN = 0,
     IDENTITY_PROBABLE = 1,
     IDENTITY_CONFIRMED = 2,
+};
+
+// 稀疏轨迹采样点 (归一化坐标 x1,y1,x2,y2 + 墙钟时间戳),
+// 供板端写入 clip meta_json -> NAS 抽帧校验时空对齐 ROI。
+struct TrackSample {
+    double ts;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
 };
 
 struct FusionConfig {
@@ -71,6 +82,8 @@ struct FusionEvent {
     IvaObject box;
     IvaObject best_box;
     int people_count;
+    // 轨迹稀疏采样 (按时间升序), 用于 NAS probable 校验按帧对齐 ROI。
+    std::vector<TrackSample> track_samples;
 };
 
 // Read-only view of one live track, used by the main loop to schedule
@@ -107,6 +120,8 @@ public:
     int probable_tracks() const;
     // Cumulative number of times any track reached CONFIRMED identity.
     int confirmed_sessions() const { return confirmed_sessions_; }
+
+    static const size_t kMaxTrackSamples = 64;
 
 private:
     struct Track {
@@ -151,10 +166,14 @@ private:
         IdentityLevel identity;
         IdentityLevel published_identity;
         std::string session_id;
+        // 有界稀疏轨迹点 (每 >=1.0s 或显著位移时 >=0.5s 记录一次, 上限 kMaxTrackSamples)。
+        std::deque<TrackSample> samples;
     };
 
     static float iou(const IvaObject& a, const IvaObject& b);
     static const char* identity_name(IdentityLevel identity);
+    static void record_sample(Track& track, double now, const IvaObject& box,
+                              float movement);
     void update_identity(Track& track, double now);
     FusionEvent make_event(const Track& track, const char* event, double now) const;
 

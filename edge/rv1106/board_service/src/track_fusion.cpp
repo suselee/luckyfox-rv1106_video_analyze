@@ -22,6 +22,24 @@ float TrackFusion::iou(const IvaObject& a, const IvaObject& b) {
     return total > 0 ? intersection / total : 0;
 }
 
+void TrackFusion::record_sample(Track& track, double now, const IvaObject& box,
+                                float movement) {
+    bool should_add = track.samples.empty();
+    if (!should_add) {
+        double dt = now - track.samples.back().ts;
+        if (dt >= 1.0 || (dt >= 0.5 && movement >= 0.05f)) should_add = true;
+    }
+    if (!should_add) return;
+    TrackSample s;
+    s.ts = now;
+    s.x1 = box.x1;
+    s.y1 = box.y1;
+    s.x2 = box.x2;
+    s.y2 = box.y2;
+    track.samples.push_back(s);
+    while (track.samples.size() > kMaxTrackSamples) track.samples.pop_front();
+}
+
 void TrackFusion::observe(double now, const IvaResult& detections) {
     people_count_ = (int)detections.people.size();
     float tallest = 0;
@@ -94,6 +112,7 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.adult_prior = false;
             track.last_probable_evidence = -1e9;
             track.identity = IDENTITY_UNKNOWN;
+            record_sample(track, now, person, 0.0f);
             tracks_[track.id] = track;
             selected = &tracks_[track.id];
         } else {
@@ -118,6 +137,7 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.last_seen = now;
             track.person_score = std::max(track.person_score, person.score);
             track.observations++;
+            record_sample(track, now, person, movement);
         }
         Track& track = *selected;
         matched_ids.push_back(track.id);
@@ -349,6 +369,18 @@ FusionEvent TrackFusion::make_event(const Track& track, const char* event, doubl
     out.box = track.box;
     out.best_box = track.best_box;
     out.people_count = people_count_;
+    out.track_samples.assign(track.samples.begin(), track.samples.end());
+    // 补尾点: 若最后一次观测距上一个采样点 > 0.05s, 追加进 track_samples 避免短轨迹丢尾。
+    if (out.track_samples.empty() ||
+        track.last_seen > out.track_samples.back().ts + 0.05) {
+        TrackSample tail;
+        tail.ts = track.last_seen;
+        tail.x1 = track.box.x1;
+        tail.y1 = track.box.y1;
+        tail.x2 = track.box.x2;
+        tail.y2 = track.box.y2;
+        out.track_samples.push_back(tail);
+    }
     return out;
 }
 

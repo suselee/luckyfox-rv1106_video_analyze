@@ -119,7 +119,8 @@ private:
     void drain_events();
     void make_clip(const FusionEvent& ev);
     std::string meta_json(const FusionEvent& ev, double clip_start,
-                          double clip_end, size_t clip_bytes);
+                          double clip_end, double eff_start, double eff_end,
+                          size_t clip_bytes);
     static std::string audio_clip_name(const std::string& audio_codec);
 
     HighStreamConfig cfg_;

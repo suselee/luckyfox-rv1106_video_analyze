@@ -377,7 +377,7 @@ void HighStream::make_clip(const FusionEvent& ev) {
         }
     }
 
-    std::string meta = meta_json(ev, ws, we, clip.size());
+    std::string meta = meta_json(ev, ws, we, eff_start, eff_end, clip.size());
     PendingClip pc;
     pc.data.swap(clip);
     pc.meta_json.swap(meta);
@@ -407,9 +407,10 @@ void HighStream::make_clip(const FusionEvent& ev) {
 }
 
 std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
-                                  double clip_end, size_t clip_bytes) {
-    char buf[1400];
-    snprintf(buf, sizeof(buf),
+                                  double clip_end, double eff_start,
+                                  double eff_end, size_t clip_bytes) {
+    char buf[1536];
+    int n = snprintf(buf, sizeof(buf),
              "{\"session_id\":\"%s\",\"event\":\"%s\",\"identity\":\"%s\","
              "\"track_id\":%u,\"ts\":%.3f,\"session_start\":%.3f,"
              "\"best_ts\":%.3f,\"score\":%.4f,\"face_score\":%.4f,"
@@ -417,10 +418,11 @@ std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
              "\"activity_peak_ts\":%.3f,\"last_active_ts\":%.3f,"
              "\"box\":[%.4f,%.4f,%.4f,%.4f],\"best_box\":[%.4f,%.4f,%.4f,%.4f],"
              "\"people_count\":%d,\"camera_id\":\"%s\","
-             "\"clip_start\":%.3f,\"clip_end\":%.3f,\"clip_bytes\":%zu,"
+             "\"clip_start\":%.3f,\"clip_end\":%.3f,"
+             "\"eff_start\":%.3f,\"eff_end\":%.3f,\"clip_bytes\":%zu,"
              "\"codec\":\"%s\",\"audio_codec\":\"%s\","
              "\"audio_rate\":%d,\"audio_channels\":%d,"
-             "\"source\":\"board_high_ring\"}",
+             "\"source\":\"board_high_ring\",\"track_samples\":[",
              ev.session_id.c_str(), ev.event.c_str(), ev.identity.c_str(),
              ev.track_id, ev.timestamp, ev.session_start, ev.best_timestamp,
              ev.score, ev.face_score, ev.person_score, ev.activity_score,
@@ -428,9 +430,41 @@ std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
              ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2,
              ev.best_box.x1, ev.best_box.y1, ev.best_box.x2, ev.best_box.y2,
              ev.people_count, cfg_.camera_id.c_str(),
-             clip_start, clip_end, clip_bytes, codec_.c_str(),
-             audio_codec_.c_str(), audio_rate_, audio_channels_);
-    return std::string(buf);
+             clip_start, clip_end, eff_start, eff_end, clip_bytes,
+             codec_.c_str(), audio_codec_.c_str(), audio_rate_, audio_channels_);
+    std::string out(buf, (n > 0 && (size_t)n < sizeof(buf)) ? (size_t)n : strlen(buf));
+
+    // 只保留落在当前切片实际时间窗内的轨迹点, 均匀降采样至最多 8 个,
+    // 供 NAS 侧 probable 校验做逐帧时空对齐 ROI (JSON 紧凑, 无截断风险)。
+    double win_lo = (eff_start > 0 && eff_end > eff_start) ? eff_start : clip_start;
+    double win_hi = (eff_start > 0 && eff_end > eff_start) ? eff_end : clip_end;
+    std::vector<const TrackSample*> in_window;
+    for (size_t i = 0; i < ev.track_samples.size(); ++i) {
+        const TrackSample& s = ev.track_samples[i];
+        if (s.ts >= win_lo - 0.5 && s.ts <= win_hi + 0.5)
+            in_window.push_back(&s);
+    }
+    const size_t kMaxMetaSamples = 8;
+    std::vector<const TrackSample*> picked;
+    if (in_window.size() <= kMaxMetaSamples) {
+        picked = in_window;
+    } else {
+        picked.reserve(kMaxMetaSamples);
+        for (size_t i = 0; i < kMaxMetaSamples; ++i) {
+            size_t idx = (i * (in_window.size() - 1)) / (kMaxMetaSamples - 1);
+            picked.push_back(in_window[idx]);
+        }
+    }
+    char sbuf[96];
+    for (size_t i = 0; i < picked.size(); ++i) {
+        const TrackSample& s = *picked[i];
+        if (i > 0) out.push_back(',');
+        int sn = snprintf(sbuf, sizeof(sbuf), "[%.3f,%.4f,%.4f,%.4f,%.4f]",
+                          s.ts, s.x1, s.y1, s.x2, s.y2);
+        if (sn > 0) out.append(sbuf, std::min((size_t)sn, sizeof(sbuf) - 1));
+    }
+    out.append("]}");
+    return out;
 }
 
 std::string HighStream::audio_clip_name(const std::string& audio_codec) {

@@ -384,6 +384,38 @@ int main() {
         assert(top.active_tracks() == 0);
     }
 
+    // P1 track_samples 回归: 移动轨迹按稀疏节奏采样 + 补尾点 + 有界上限 <= kMaxTrackSamples
+    {
+        FusionConfig scfg = test_config();
+        TrackFusion traj(scfg);
+        // t=0..5 每 0.3s 观测一次 (走过屏幕), 0.3s 间隔会被稀疏去重
+        for (int i = 0; i <= 18; ++i) {
+            double t = i * 0.3;
+            float x = 0.10f + 0.03f * i;
+            traj.observe(t, one_person(1, x, 0.35f));
+        }
+        events = traj.collect_events(5.4);
+        assert(events.size() == 1 && events[0].event == "start");
+        const std::vector<TrackSample>& s1 = events[0].track_samples;
+        assert(s1.size() >= 5 && s1.size() <= 12);
+        assert(s1.front().ts == 0.0);
+        assert(s1.back().ts >= 5.39);
+        assert(s1.back().x1 > s1.front().x1 + 0.4f);
+
+        // 长轨迹 (90s) 采样上限受 kMaxTrackSamples 约束 (尾点补录最多 +1)
+        TrackFusion long_traj(scfg);
+        for (int i = 0; i < 90; ++i) {
+            float x = 0.10f + (float)(i % 5) * 0.05f;
+            long_traj.observe((double)i, one_person(1, x, 0.35f));
+            long_traj.collect_events((double)i);
+        }
+        events = long_traj.finish_sessions(90.0);
+        assert(events.size() == 1 && events[0].event == "end");
+        assert(events[0].track_samples.size() <= TrackFusion::kMaxTrackSamples + 1);
+        assert(events[0].track_samples.front().ts >= 25.0);
+        assert(events[0].track_samples.back().ts == 89.0);
+    }
+
     printf("TRACK_FUSION_TEST_OK\n");
     return 0;
 }
