@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -593,14 +593,21 @@ async def remux_elementary_stream(
             command += ["-c:a", settings.clip_audio_codec, "-b:a", "192k"]
         else:
             command += ["-c:a", "copy"]
-    # 写入真实拍摄时刻: 裸流重封装出的 MP4 默认没有 creation_time,
-    # Nextcloud/Immich 只能退回文件 mtime, 而 mtime 按 UTC 分组会把
-    # 本地 08:00 之前的片段归到前一天。这里写成 UTC ISO-8601, 由
-    # 客户端按自身时区换算。
+    # 写入拍摄时刻。必须写**本地墙钟**而不是 UTC:
+    # ffmpeg 写出的 QuickTime CreateDate 不带时区后缀, exiftool 读回来是
+    # 无偏移的墙钟值, Immich 因此走 `!hasZone` 分支把它原样当作 UTC 存进
+    # asset.localDateTime, 再用 (localDateTime AT TIME ZONE 'UTC')::date
+    # 计算时间轴分组。若写真实 UTC, UTC+8 下 08:00 之前的片段会被算到
+    # 前一天 (实测 5,909 条早间资产错位: 本地 07:57 -> bucket 前一日)。
+    # 写本地墙钟后与手机照片的 EXIF 语义一致, Immich 分组正确。
     if creation_time is not None:
-        stamp = creation_time.astimezone(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.000000Z"
+        # 参数语义是"时刻"; 写入前统一转成本地时区的墙钟时间。
+        local_time = (
+            creation_time.astimezone()
+            if creation_time.tzinfo is not None
+            else creation_time
         )
+        stamp = local_time.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
         command += ["-metadata", f"creation_time={stamp}"]
     command += [
         "-movflags",
