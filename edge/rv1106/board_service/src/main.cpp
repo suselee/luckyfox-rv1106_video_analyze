@@ -540,7 +540,7 @@ int main(int argc, char* argv[]) {
                 char high_json[2048];
                 high_json[0] = '\0';
                 if (g_high) g_high->status_json(high_json, sizeof(high_json));
-                char status[2048];
+                char status[3072];
                 snprintf(status, sizeof(status),
                          "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"sleeping\","
                          "\"schedule_active\":false,\"active_window_start\":\"%s\","
@@ -1236,7 +1236,6 @@ int main(int argc, char* argv[]) {
                          "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld%s}",
                           now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
                           schedule_start_text.c_str(), schedule_end_text.c_str(),
-                          full_frame_scans, full_frame_detections,
                           schedule.utc_offset_minutes,
                           level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
                           stats.temperature_c, p95,
@@ -1244,6 +1243,7 @@ int main(int argc, char* argv[]) {
                           fusion.active_tracks(), fusion.confirmed_tracks(),
                           fusion.probable_tracks(), fusion.confirmed_sessions(),
                           rockiva_face_detections, face_scan_attempts, roi_scans,
+                          full_frame_scans, full_frame_detections,
                           retinaface_detections,
                           eligible_face_detections, face_track_matches,
                           embedding_successes, similarity_samples,

@@ -68,17 +68,29 @@ public:
     void snapshot(UploadStats& out);
     void status_json(char* buf, size_t n);  // 追加到 health payload
 
-    bool running() const { return running_; }
+    bool running() const { return running_.load(); }
 
     // feed 看门狗 (主线程 HEALTH 中检查): feed 线程每收到视频块刷新一次。
     // 运行 + 未暂停态下超限无数据 → 主循环退出重建整条管线。
-    // (volatile double 跨线程读写: 对齐访问下撕裂读仅造成单次误判/漏判,
-    // HEALTH 每 60s 复核, 无需加锁; 与 VideoRing 在 status_json 中的既有用法一致。)
-    void note_chunk() { last_chunk_ts_ = now_seconds(); }
-    double seconds_since_data(double now) const { return now - last_chunk_ts_; }
+    // 经 state_mu_ 保护, 避免 32 位 ARM 上 64 位 double 跨线程撕裂读与弱内存序问题。
+    void note_chunk() {
+        double ts = now_seconds();
+        pthread_mutex_lock(&state_mu_);
+        last_chunk_ts_ = ts;
+        pthread_mutex_unlock(&state_mu_);
+    }
+    double seconds_since_data(double now) const {
+        pthread_mutex_lock(&state_mu_);
+        double ts = last_chunk_ts_;
+        pthread_mutex_unlock(&state_mu_);
+        return now - ts;
+    }
     bool feed_stalled(double now, double limit) const {
-        return running_ && !paused_.load() &&
-               last_chunk_ts_ > 0 && (now - last_chunk_ts_) > limit;
+        if (!running_.load() || paused_.load()) return false;
+        pthread_mutex_lock(&state_mu_);
+        double ts = last_chunk_ts_;
+        pthread_mutex_unlock(&state_mu_);
+        return ts > 0 && (now - ts) > limit;
     }
 
     // 窗口外暂停: 保持线程与 FIFO fd 存活, 仅停止读取。
@@ -86,7 +98,7 @@ public:
     // resume() 后从暂停点继续, 无需重连/重新握手。
     void pause();
     void resume();
-    bool paused() const { return paused_; }
+    bool paused() const { return paused_.load(); }
 
 private:
     struct PendingClip {
@@ -114,13 +126,13 @@ private:
     VideoRing ring_;
     AudioRing audio_ring_;
     std::string codec_;  // "H264"/"H265" (feed 线程写, 单线程访问)
-    std::string audio_codec_; // "PCMU"/"PCMA"/"AAC" (feed 线程写)
+    std::string audio_codec_; // "PCMU"/"PCMA"/"AAC" (写: feed 线程; 读: feed + 主线程 status_json, 经 state_mu_ 同步)
     int audio_rate_ = 8000;
     int audio_channels_ = 1;
     unsigned long long audio_chunks_ = 0;
     pthread_t feed_th_ = 0;
     pthread_t upload_th_ = 0;
-    volatile bool running_ = false;
+    std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
 
     pthread_mutex_t ev_mu_ = PTHREAD_MUTEX_INITIALIZER;
@@ -130,9 +142,10 @@ private:
     pthread_cond_t up_cond_ = PTHREAD_COND_INITIALIZER;
     std::deque<PendingClip> up_queue_;
 
+    mutable pthread_mutex_t state_mu_ = PTHREAD_MUTEX_INITIALIZER;
     UploadStats stats_;
     double last_cut_ts_ = 0.0;   // 上次成功切片时间 (全局冷却, feed 线程独占)
-    volatile double last_chunk_ts_ = -1e9;  // 最近收到视频块时刻 (feed 写, 主读)
+    double last_chunk_ts_ = -1e9;  // 最近收到视频块时刻 (经 state_mu_ 同步)
 };
 
 } // namespace dw

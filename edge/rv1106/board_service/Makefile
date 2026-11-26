@@ -23,7 +23,7 @@ ROCKIVA_MODEL_DIR = $(ROCKIVA_DIR)/models/rockiva_data_rv1106
 FACE_MODEL_DIR ?= /home/suse/arm-rockchip830-linux-uclibcgnueabihf/daughter_watch/models
 
 SRC = src
-CXXFLAGS = -O2 -Wall -std=c++11
+CXXFLAGS = -O2 -Wall -Werror=format -std=c++11
 CXXFLAGS += -I$(SRC) -I$(RKNN_API_INC) -I$(THIRDPARTY) -I$(ROCKIT_INC) -I$(ROCKIVA_INC)
 
 RKNN_LDFLAGS   = -L$(RKNN_API_LIB) -lrknnmrt

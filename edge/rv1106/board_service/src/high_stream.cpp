@@ -30,24 +30,24 @@ bool HighStream::start() {
     ring_.resize(cfg_.ring_mb * 1024 * 1024);
     audio_ring_.resize(cfg_.audio_ring_mb * 1024 * 1024);
     // 看门狗宽限: 从此刻起算, 首个 4K 块到达前不判饥饿。
-    last_chunk_ts_ = now_seconds();
-    running_ = true;
+    note_chunk();
+    running_.store(true);
     if (pthread_create(&feed_th_, NULL, feed_thread_fn, this) != 0) {
-        running_ = false;
+        running_.store(false);
         return false;
     }
     if (pthread_create(&upload_th_, NULL, upload_thread_fn, this) != 0) {
-        running_ = false;
+        running_.store(false);
         pthread_join(feed_th_, NULL);
+        feed_th_ = 0;
         return false;
     }
     return true;
 }
 
 void HighStream::stop() {
-    if (!running_) return;
-    running_ = false;
-    paused_ = false;
+    if (!running_.exchange(false)) return;
+    paused_.store(false);
     // 唤醒上传线程
     pthread_mutex_lock(&up_mu_);
     pthread_cond_broadcast(&up_cond_);
@@ -59,14 +59,14 @@ void HighStream::stop() {
 }
 
 void HighStream::pause() {
-    paused_ = true;
+    paused_.store(true);
 }
 
 void HighStream::resume() {
     // 暂停期间 (窗口外可达 10h) 无数据是正常的: 恢复时重置心跳,
     // 否则 resume 后立即误判饥饿。死流则按正常宽限重新计时。
-    last_chunk_ts_ = now_seconds();
-    paused_ = false;
+    note_chunk();
+    paused_.store(false);
 }
 
 // ---- 事件入队 ---------------------------------------------------------------
@@ -97,33 +97,39 @@ void HighStream::feed_loop() {
     std::vector<uint8_t> chunk(512 * 1024);
     std::vector<uint8_t> audio_chunk(64 * 1024);
     int reconnect_wait = 2;
-     int idle_chunk_reads = 0;
-     size_t session_chunks = 0;
-     size_t session_baseline = 0;
-     int audio_pipe_fd_ = -1;
-     // pipe 模式 (ffmpeg 输出到 FIFO): 读端必须全程持有 fd, 绝不关闭。
-     // 关闭读端会让 ffmpeg 写端收到 SIGPIPE 死亡 (与主循环 stdin 模式同理);
-     // stall/EOF 时只 sleep 等待, 同一个 fd 上 ffmpeg 恢复写入后自动续流。
-     const bool pipe_mode = !cfg_.pipe_path.empty();
+    int idle_chunk_reads = 0;
+    size_t session_chunks = 0;
+    size_t session_baseline = 0;
+    int audio_pipe_fd_ = -1;
+    // pipe 模式 (ffmpeg 输出到 FIFO): 读端必须全程持有 fd, 绝不关闭。
+    // 关闭读端会让 ffmpeg 写端收到 SIGPIPE 死亡 (与主循环 stdin 模式同理);
+    // stall/EOF 时只 sleep 等待, 同一个 fd 上 ffmpeg 恢复写入后自动续流。
+    const bool pipe_mode = !cfg_.pipe_path.empty();
 
-     while (running_) {
+    while (running_.load()) {
         // 处理队列里的融合事件 (切片/上传)
         drain_events();
 
         // 窗口外暂停: 不读流 (背压阻塞 ffmpeg-high), 保持 fd 与连接存活。
-        if (paused_) {
+        if (paused_.load()) {
             usleep(200 * 1000);
             continue;
         }
 
         // FIFO 音频 (ADTS): 每次循环排空, 时间戳用到达时间 (实时流)。
         if (audio_pipe_fd_ >= 0) {
-            while (running_) {
+            unsigned long long added_chunks = 0;
+            while (running_.load()) {
                 ssize_t an = ::read(audio_pipe_fd_, audio_chunk.data(),
                                     audio_chunk.size());
                 if (an <= 0) break;
                 audio_ring_.push(audio_chunk.data(), (size_t)an, now_seconds());
-                audio_chunks_++;
+                added_chunks++;
+            }
+            if (added_chunks > 0) {
+                pthread_mutex_lock(&state_mu_);
+                audio_chunks_ += added_chunks;
+                pthread_mutex_unlock(&state_mu_);
             }
         }
 
@@ -142,9 +148,11 @@ void HighStream::feed_loop() {
                                      O_RDONLY | O_NONBLOCK);
                     if (afd >= 0) {
                         audio_pipe_fd_ = afd;
+                        pthread_mutex_lock(&state_mu_);
                         audio_codec_ = "AAC";
                         audio_rate_ = 16000;
                         audio_channels_ = 1;
+                        pthread_mutex_unlock(&state_mu_);
                     }
                 }
             } else {
@@ -162,20 +170,28 @@ void HighStream::feed_loop() {
             codec_ = codec_storage;
             // pipe 模式下音频 codec 由 open_pipe 成功路径设置 (AAC), 不能清掉;
             // 否则 make_clip 因 audio_codec_ 为空永不切音频。
+            std::string neg_codec;
+            int neg_rate = 8000;
+            int neg_channels = 1;
+            pthread_mutex_lock(&state_mu_);
             if (audio_pipe_fd_ < 0) {
                 audio_codec_.clear();
                 audio_rate_ = 8000;
                 audio_channels_ = 1;
             }
             audio_chunks_ = 0;
-             if (src.has_audio() || audio_pipe_fd_ >= 0) {
-                if (src.has_audio()) {
-                    audio_codec_ = src.audio().codec;
-                    audio_rate_ = src.audio().rate;
-                    audio_channels_ = src.audio().channels;
-                }
+            if (src.has_audio()) {
+                audio_codec_ = src.audio().codec;
+                audio_rate_ = src.audio().rate;
+                audio_channels_ = src.audio().channels;
+            }
+            neg_codec = audio_codec_;
+            neg_rate = audio_rate_;
+            neg_channels = audio_channels_;
+            pthread_mutex_unlock(&state_mu_);
+            if (src.has_audio() || audio_pipe_fd_ >= 0) {
                 printf("[HIGH] audio negotiated: %s/%dHz/%dch\n",
-                       audio_codec_.c_str(), audio_rate_, audio_channels_);
+                       neg_codec.c_str(), neg_rate, neg_channels);
             } else {
                 printf("[HIGH] no audio track (or disabled); video-only clips\n");
             }
@@ -203,12 +219,18 @@ void HighStream::feed_loop() {
             // 音频包/RTCP: 数据在流动, 重置 stall 计数即可
             idle_chunk_reads = 0;
             if (!audio_codec_.empty()) {
-                while (running_) {
+                unsigned long long added_chunks = 0;
+                while (running_.load()) {
                     int an = src.read_audio(audio_chunk.data(),
                                             (int)audio_chunk.size());
                     if (an <= 0) break;
                     audio_ring_.push(audio_chunk.data(), (size_t)an, now_seconds());
-                    audio_chunks_++;
+                    added_chunks++;
+                }
+                if (added_chunks > 0) {
+                    pthread_mutex_lock(&state_mu_);
+                    audio_chunks_ += added_chunks;
+                    pthread_mutex_unlock(&state_mu_);
                 }
             }
             continue;
@@ -241,12 +263,18 @@ void HighStream::feed_loop() {
         }
         // 音频: read_chunk 已把音频包喂进源内缓冲, 这里排空入音频环。
         if (!audio_codec_.empty()) {
-            while (running_) {
+            unsigned long long added_chunks = 0;
+            while (running_.load()) {
                 int an = src.read_audio(audio_chunk.data(),
                                         (int)audio_chunk.size());
                 if (an <= 0) break;
                 audio_ring_.push(audio_chunk.data(), (size_t)an, now_seconds());
-                audio_chunks_++;
+                added_chunks++;
+            }
+            if (added_chunks > 0) {
+                pthread_mutex_lock(&state_mu_);
+                audio_chunks_ += added_chunks;
+                pthread_mutex_unlock(&state_mu_);
             }
         }
     }
@@ -268,7 +296,7 @@ void HighStream::drain_events() {
 }
 
 void HighStream::make_clip(const FusionEvent& ev) {
-    if (paused_) return;  // 窗口外不切片 (双保险: 主循环窗口外本就不产事件)
+    if (paused_.load()) return;  // 窗口外不切片 (双保险: 主循环窗口外本就不产事件)
     bool do_cut = ev.event == "end" &&
                   (ev.identity == "confirmed" ||
                    (cfg_.upload_probable && ev.identity == "probable"));
@@ -280,7 +308,9 @@ void HighStream::make_clip(const FusionEvent& ev) {
     double now = now_seconds();
     if (ev.identity != "confirmed" && cfg_.min_interval_seconds > 0 &&
         last_cut_ts_ > 0 && now - last_cut_ts_ < cfg_.min_interval_seconds) {
+        pthread_mutex_lock(&state_mu_);
         stats_.cut_skipped++;
+        pthread_mutex_unlock(&state_mu_);
         printf("[HIGH] cut skipped (cooldown %.0fs) session=%s\n",
                now - last_cut_ts_, ev.session_id.c_str());
         return;
@@ -300,7 +330,9 @@ void HighStream::make_clip(const FusionEvent& ev) {
     ws = std::max(ws, ring_.oldest_ts());
     we = std::min(we, ring_.newest_ts());
     if (we - ws < cfg_.min_clip_seconds) {
+        pthread_mutex_lock(&state_mu_);
         stats_.cut_reject++;
+        pthread_mutex_unlock(&state_mu_);
         printf("[HIGH] cut rejected (%d) session=%s window=[%.1f,%.1f] ring=[%.1f,%.1f]\n",
                (int)CutResult::EMPTY_WINDOW, ev.session_id.c_str(),
                ws, we, ring_.oldest_ts(), ring_.newest_ts());
@@ -313,13 +345,17 @@ void HighStream::make_clip(const FusionEvent& ev) {
     CutResult rc = ring_.cut(ws, we, 0.0, 0.0, cfg_.gap_limit,
                              max_bytes, clip, &eff_start, &eff_end);
     if (rc != CutResult::OK) {
+        pthread_mutex_lock(&state_mu_);
         stats_.cut_reject++;
+        pthread_mutex_unlock(&state_mu_);
         printf("[HIGH] cut rejected (%d) session=%s window=[%.1f,%.1f] ring=[%.1f,%.1f]\n",
                (int)rc, ev.session_id.c_str(), ws, we,
                ring_.oldest_ts(), ring_.newest_ts());
         return;
     }
+    pthread_mutex_lock(&state_mu_);
     stats_.cut_ok++;
+    pthread_mutex_unlock(&state_mu_);
     last_cut_ts_ = now;
 
     // 音频: 按视频实际切片边界 (eff_start/eff_end) 同窗口截取;
@@ -353,15 +389,21 @@ void HighStream::make_clip(const FusionEvent& ev) {
     }
     pc.next_ts = now_seconds();
 
+    bool dropped = false;
     pthread_mutex_lock(&up_mu_);
     if ((int)up_queue_.size() >= cfg_.max_queue) {
         up_queue_.pop_front();
-        stats_.queue_drops++;
-        printf("[HIGH] upload queue full; dropped oldest clip\n");
+        dropped = true;
     }
     up_queue_.push_back(std::move(pc));
     pthread_cond_signal(&up_cond_);
     pthread_mutex_unlock(&up_mu_);
+    if (dropped) {
+        pthread_mutex_lock(&state_mu_);
+        stats_.queue_drops++;
+        pthread_mutex_unlock(&state_mu_);
+        printf("[HIGH] upload queue full; dropped oldest clip\n");
+    }
 }
 
 std::string HighStream::meta_json(const FusionEvent& ev, double clip_start,
@@ -403,11 +445,11 @@ void HighStream::upload_loop() {
     HttpUploader uploader;
     const std::string boundary = "dwclip-boundary";
 
-    while (running_) {
+    while (running_.load()) {
         pthread_mutex_lock(&up_mu_);
-        while (running_ && up_queue_.empty())
+        while (running_.load() && up_queue_.empty())
             pthread_cond_wait(&up_cond_, &up_mu_);
-        if (!running_) {
+        if (!running_.load()) {
             pthread_mutex_unlock(&up_mu_);
             break;
         }
@@ -431,8 +473,11 @@ void HighStream::upload_loop() {
                                           {{"meta", pc.meta_json}}, files,
                                           cfg_.upload_timeout, resp);
         if (ok) {
+            double done_ts = now_seconds();
+            pthread_mutex_lock(&state_mu_);
             stats_.uploads_ok++;
-            stats_.last_upload_ts = now_seconds();
+            stats_.last_upload_ts = done_ts;
+            pthread_mutex_unlock(&state_mu_);
             printf("[HIGH] upload OK session=%s bytes=%zu status=%d\n",
                    pc.session_id.c_str(), pc.data.size(), resp.status);
         } else {
@@ -445,7 +490,9 @@ void HighStream::upload_loop() {
                 printf("[HIGH] upload failed (retry %d/%d)\n",
                        pc.attempts, cfg_.max_retries);
             } else {
+                pthread_mutex_lock(&state_mu_);
                 stats_.uploads_failed++;
+                pthread_mutex_unlock(&state_mu_);
                 printf("[HIGH] upload FAILED permanently\n");
             }
         }
@@ -455,13 +502,27 @@ void HighStream::upload_loop() {
 
 // ---- 状态 ----------------------------------------------------------------
 void HighStream::snapshot(UploadStats& out) {
+    pthread_mutex_lock(&state_mu_);
     out = stats_;
+    pthread_mutex_unlock(&state_mu_);
 }
 
 void HighStream::status_json(char* buf, size_t n) {
     pthread_mutex_lock(&up_mu_);
     size_t pending = up_queue_.size();
     pthread_mutex_unlock(&up_mu_);
+
+    UploadStats snap;
+    std::string audio_codec;
+    int audio_rate = 0;
+    unsigned long long audio_chunks = 0;
+    pthread_mutex_lock(&state_mu_);
+    snap = stats_;
+    audio_codec = audio_codec_;
+    audio_rate = audio_rate_;
+    audio_chunks = audio_chunks_;
+    pthread_mutex_unlock(&state_mu_);
+
     snprintf(buf, n,
              ",\"high_ring\":{\"enabled\":%s,\"fill_percent\":%.1f,"
              "\"nals\":%zu,\"oldest_age_s\":%.0f,\"dropped_nals\":%llu,"
@@ -476,10 +537,10 @@ void HighStream::status_json(char* buf, size_t n) {
                               : 0.0,
              ring_.nal_count(),
              ring_.newest_ts() - ring_.oldest_ts(),
-             ring_.dropped_nals(), stats_.uploads_ok, stats_.uploads_failed,
-             stats_.cut_ok, stats_.cut_reject, stats_.cut_skipped,
-             stats_.queue_drops, pending,
-             audio_codec_.c_str(), audio_rate_, audio_chunks_,
+             ring_.dropped_nals(), snap.uploads_ok, snap.uploads_failed,
+             snap.cut_ok, snap.cut_reject, snap.cut_skipped,
+             snap.queue_drops, pending,
+             audio_codec.c_str(), audio_rate, audio_chunks,
              audio_ring_.newest_ts() - audio_ring_.oldest_ts());
 }
 
