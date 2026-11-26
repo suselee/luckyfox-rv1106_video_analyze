@@ -6,7 +6,7 @@ import json
 import mimetypes
 import signal
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,7 +19,7 @@ from .database import Database
 from .ingest import (
     IngestSpool,
     ingest_event_key,
-    parse_multipart,
+    parse_multipart_spans,
     validate_meta,
 )
 from .workers import Supervisor, health_snapshot
@@ -67,6 +67,9 @@ class AppState:
     settings: Settings
     database: Database
     supervisor: Supervisor
+    ingest_semaphore: threading.BoundedSemaphore = field(
+        default_factory=lambda: threading.BoundedSemaphore(2)
+    )
 
 
 class WorkerRuntime:
@@ -240,7 +243,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "missing multipart boundary")
             return
 
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
+            return
         if length <= 0:
             self._send_error_json(HTTPStatus.BAD_REQUEST, "missing Content-Length")
             return
@@ -251,64 +258,83 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        raw = self.rfile.read(length)
-        if len(raw) != length:
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "short body")
-            return
-
-        try:
-            parts = parse_multipart(raw, boundary)
-        except ValueError as exc:
-            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
-            return
-        meta_part = next((part for part in parts if part.name == "meta"), None)
-        video_part = next(
-            (part for part in parts if part.name == "video" and part.filename),
-            None,
-        )
-        if meta_part is None or video_part is None:
+        semaphore = self.state.ingest_semaphore
+        if not semaphore.acquire(timeout=5.0):
             self._send_error_json(
-                HTTPStatus.BAD_REQUEST, "multipart must contain meta and video parts"
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "board ingest busy, retry later",
             )
             return
-        audio_part = next(
-            (
-                part
-                for part in parts
-                if part.name == "audio"
-                and part.filename in _AUDIO_FILENAMES
-            ),
-            None,
-        )
-
         try:
-            meta, meta_error = validate_meta(json.loads(meta_part.data.decode("utf-8")))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "meta is not valid JSON")
-            return
-        if meta is None:
-            self._send_error_json(HTTPStatus.BAD_REQUEST, meta_error or "invalid meta")
-            return
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "short body")
+                return
 
-        event_key = ingest_event_key(meta)
-        existing = self.state.database.ingested_moment_id(event_key)
-        spool = IngestSpool(settings)
-        if existing is not None or (spool.pending_dir / event_key).exists():
-            self._send_json(
-                {"accepted": True, "duplicate": True, "event_key": event_key}
+            try:
+                spans = parse_multipart_spans(raw, boundary)
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            meta_span = next((span for span in spans if span.name == "meta"), None)
+            video_span = next(
+                (span for span in spans if span.name == "video" and span.filename),
+                None,
             )
-            return
+            if meta_span is None or video_span is None:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST, "multipart must contain meta and video parts"
+                )
+                return
+            audio_span = next(
+                (
+                    span
+                    for span in spans
+                    if span.name == "audio"
+                    and span.filename in _AUDIO_FILENAMES
+                ),
+                None,
+            )
 
-        spool.spool(
-            meta,
-            video_part.data,
-            audio=audio_part.data if audio_part else None,
-            audio_name=audio_part.filename if audio_part else None,
-        )
-        self._send_json(
-            {"accepted": True, "duplicate": False, "event_key": event_key},
-            status=HTTPStatus.ACCEPTED,
-        )
+            try:
+                meta_text = raw[meta_span.start : meta_span.end].decode("utf-8")
+                meta, meta_error = validate_meta(json.loads(meta_text))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "meta is not valid JSON")
+                return
+            if meta is None:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, meta_error or "invalid meta")
+                return
+
+            event_key = ingest_event_key(meta)
+            existing = self.state.database.ingested_moment_id(event_key)
+            spool = IngestSpool(settings)
+            if existing is not None or (spool.pending_dir / event_key).exists():
+                self._send_json(
+                    {"accepted": True, "duplicate": True, "event_key": event_key}
+                )
+                return
+
+            raw_view = memoryview(raw)
+            try:
+                spool.spool(
+                    meta,
+                    raw_view[video_span.start : video_span.end],
+                    audio=(
+                        raw_view[audio_span.start : audio_span.end]
+                        if audio_span is not None
+                        else None
+                    ),
+                    audio_name=audio_span.filename if audio_span is not None else None,
+                )
+            finally:
+                raw_view.release()
+            self._send_json(
+                {"accepted": True, "duplicate": False, "event_key": event_key},
+                status=HTTPStatus.ACCEPTED,
+            )
+        finally:
+            semaphore.release()
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path

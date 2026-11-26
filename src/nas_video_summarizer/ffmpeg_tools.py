@@ -361,6 +361,58 @@ async def extract_cropped_frame(
     await _run_command(command, "ffmpeg ROI frame extraction failed")
 
 
+async def extract_roi_and_full_frame(
+    settings: Settings,
+    video_path: Path,
+    roi_output_path: Path,
+    full_output_path: Path,
+    offset_seconds: float,
+    *,
+    roi: tuple[float, float, float, float],
+    output_width: int,
+) -> None:
+    """Single-seek dual output: extract a 4K-cropped ROI and full frame in one decode."""
+    x, y, width, height = roi
+    if width <= 0 or height <= 0:
+        raise ValueError("ROI width and height must be positive")
+    out_w = max(32, output_width)
+    filter_complex = (
+        f"[0:v]split=2[roi_in][full_in];"
+        f"[roi_in]crop=iw*{width:.8f}:ih*{height:.8f}:"
+        f"iw*{x:.8f}:ih*{y:.8f},scale={out_w}:-2[roi_out];"
+        f"[full_in]scale={out_w}:-2[full_out]"
+    )
+    command = [
+        settings.ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *_hwaccel_args(settings),
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-i",
+        str(video_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[roi_out]",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "4",
+        str(roi_output_path),
+        "-map",
+        "[full_out]",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "4",
+        str(full_output_path),
+    ]
+    await _run_command(command, "ffmpeg ROI/full frame extraction failed")
+
+
 async def sample_frames_with_offsets(
     settings: Settings,
     video_path: Path,

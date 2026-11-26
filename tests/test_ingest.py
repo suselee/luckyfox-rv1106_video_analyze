@@ -666,3 +666,190 @@ def test_save_ingested_clip_verify_confirmed_skips_verification(tmp_path, monkey
     )
     assert moment_id is not None
     assert verifier.calls == []  # confirmed 不走校验
+
+
+def test_parse_multipart_spans_matches_bytes():
+    body = build_multipart_with_audio(SAMPLE_META)
+    spans = ingest_module.parse_multipart_spans(body, BOUNDARY)
+    assert [span.name for span in spans] == ["meta", "video", "audio"]
+    view = memoryview(body)
+    assert bytes(view[spans[1].start : spans[1].end]) == VIDEO_BYTES
+    assert bytes(view[spans[2].start : spans[2].end]) == AUDIO_BYTES
+
+
+def test_spool_atomic_and_ignores_hidden_staging(tmp_path):
+    settings = replace(load_settings("/nonexistent.env"), board_ingest_dir=tmp_path / "spool")
+    spool = IngestSpool(settings)
+    # 模拟写盘中途的隐藏临时目录: pending_jobs 必须忽略, 不提前消费半截文件
+    hidden = spool.pending_dir / ".staging-partial-123"
+    hidden.mkdir(parents=True)
+    (hidden / "meta.json").write_text("{truncated", encoding="utf-8")
+    assert spool.pending_jobs() == []
+
+    # 支持 memoryview 零拷贝落盘, 且不残留 .staging-* 目录
+    video_view = memoryview(VIDEO_BYTES)
+    audio_view = memoryview(AUDIO_BYTES)
+    meta = dict(SAMPLE_META, audio_codec="PCMA", audio_rate=8000, audio_channels=1)
+    job_dir = spool.spool(meta, video_view, audio=audio_view, audio_name="clip.g711a")
+    assert spool.pending_jobs() == [job_dir]
+    assert spool.job_video_path(job_dir, meta).read_bytes() == VIDEO_BYTES
+    assert spool.job_audio_path(job_dir, meta).read_bytes() == AUDIO_BYTES
+
+    # 重复写入同一 key 幂等返回, 不抛异常也不残留 staging
+    again = spool.spool(meta, video_view, audio=audio_view, audio_name="clip.g711a")
+    assert again == job_dir
+    staging_leftovers = [
+        entry for entry in spool.pending_dir.iterdir() if entry.name.startswith(".staging-")
+    ]
+    assert staging_leftovers == [hidden]
+
+
+def test_save_ingested_clip_preserves_existing_moment_when_db_insert_fails(tmp_path, monkeypatch):
+    """新片段入库失败时, 计划淘汰的旧片段文件和 DB 记录不得提前删除。"""
+    settings = replace(
+        _make_settings(tmp_path),
+        max_moments_per_day=1,
+        rv1106_ingest_cooldown_seconds=0,
+    )
+    database = Database(settings.database_path)
+    database.migrate()
+
+    weak_meta = dict(SAMPLE_META, session_id="1-1", score=0.5, face_score=0.1)
+    weak_id, database, _, _ = _save_clip(tmp_path, monkeypatch, weak_meta, settings, database)
+    assert weak_id is not None
+    weak = database.get_moment(weak_id)
+    weak_clip = Path(weak["clip_path"])
+    weak_meta_path = Path(weak["metadata_path"])
+
+    # 准备更强片段, 但让 create_moment 抛异常
+    strong_meta = dict(SAMPLE_META, session_id="2-2", score=0.95, face_score=0.9)
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(strong_meta, VIDEO_BYTES)
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        output_path.write_bytes(input_path.read_bytes())
+
+    def failing_create_moment(*args, **kwargs):
+        raise RuntimeError("sqlite busy")
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+    monkeypatch.setattr(database, "create_moment", failing_create_moment)
+
+    with pytest.raises(RuntimeError, match="sqlite busy"):
+        asyncio.run(save_ingested_clip(settings, database, spool, job_dir))
+
+    # 旧片段完好无损, 新片段未遗留孤儿文件
+    assert database.get_moment(weak_id) is not None
+    assert weak_clip.exists()
+    assert weak_meta_path.exists()
+    assert list(weak_clip.parent.glob("*.mp4")) == [weak_clip]
+
+
+def test_save_ingested_clip_probable_verify_reuses_single_remux(tmp_path, monkeypatch):
+    settings = replace(_make_settings(tmp_path), rv1106_probable_policy="verify")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    spool = IngestSpool(settings)
+    job_dir = spool.spool(_probable_meta(), VIDEO_BYTES)
+
+    remux_calls = 0
+
+    async def fake_remux(settings_, input_path, output_path, **kwargs):
+        nonlocal remux_calls
+        remux_calls += 1
+        output_path.write_bytes(input_path.read_bytes())
+
+    async def fake_extract(settings_, video_path_, output_path, offset, *, roi, output_width):
+        output_path.write_bytes(b"jpg")
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", fake_remux)
+    monkeypatch.setattr(ingest_module, "extract_cropped_frame", fake_extract)
+
+    verifier = _FakeVerifier(accepted=True)
+    moment_id = asyncio.run(
+        save_ingested_clip(settings, database, spool, job_dir, probable_verifier=verifier)
+    )
+    assert moment_id is not None
+    assert remux_calls == 1  # 校验阶段与发布阶段复用同一次重封装
+
+
+def test_verify_probable_clip_dual_extract_single_pass_fallback(tmp_path, monkeypatch):
+    """默认双输出抽帧路径: ROI 失败回退整帧时不再二次调用 ffmpeg。"""
+    settings = replace(
+        _make_settings(tmp_path),
+        rv1106_probable_policy="verify",
+        rv1106_verify_fallback_allow_faceless=False,
+    )
+    clip_mp4 = tmp_path / "already_muxed.mp4"
+    clip_mp4.write_bytes(VIDEO_BYTES)
+
+    remux_calls = 0
+    dual_calls = 0
+
+    async def unexpected_remux(*args, **kwargs):
+        nonlocal remux_calls
+        remux_calls += 1
+
+    async def fake_dual_extract(
+        settings_, video_path_, roi_path, full_path, offset, *, roi, output_width
+    ):
+        nonlocal dual_calls
+        dual_calls += 1
+        roi_path.write_bytes(b"roi-jpg")
+        full_path.write_bytes(b"full-jpg")
+
+    class _FallbackVerifier:
+        def __init__(self):
+            self.calls = []
+
+        def verify_board_probable_paths(self, paths, **kwargs):
+            self.calls.append([p.name for p in paths])
+            if len(self.calls) == 1:
+                return _FakeVerification(False, "no_person")
+            return _FakeVerification(True, "child_face")
+
+    monkeypatch.setattr(ingest_module, "remux_elementary_stream", unexpected_remux)
+    monkeypatch.setattr(ingest_module, "extract_roi_and_full_frame", fake_dual_extract)
+
+    verifier = _FallbackVerifier()
+    accepted, decision, _ = asyncio.run(
+        ingest_module._verify_probable_clip(settings, clip_mp4, _probable_meta(), verifier)
+    )
+    assert accepted is True
+    assert decision == "child_face"
+    assert remux_calls == 0  # .mp4 输入直接抽帧, 无需重封装
+    assert dual_calls == 5   # 单次解码产出 ROI + 整帧, 回退零额外调用
+    assert len(verifier.calls) == 2
+    assert all(name.startswith("clip-roi-") for name in verifier.calls[0])
+    assert all(name.startswith("clip-full-") for name in verifier.calls[1])
+
+
+def test_ingest_endpoint_invalid_content_length_and_busy(tmp_path):
+    settings = _make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.migrate()
+
+    handler, stored = _ingest_handler(settings, database)
+    handler.headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": "not-a-number",
+    }
+    handler._handle_board_ingest()
+    assert stored["error"][0].value == 400
+
+    # 占满并发槽位后返回 503 提示板端稍后重试
+    body = build_multipart(SAMPLE_META)
+    handler2, stored2 = _ingest_handler(settings, database)
+    handler2.headers = {
+        "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+        "Content-Length": str(len(body)),
+    }
+    handler2.rfile = BytesIO(body)
+    handler2.state.ingest_semaphore = type(
+        "_BusySem", (), {"acquire": lambda self, timeout=None: False, "release": lambda self: None}
+    )()
+    handler2._handle_board_ingest()
+    assert stored2["error"][0].value == 503

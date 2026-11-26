@@ -18,6 +18,7 @@ import json
 import time
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,13 @@ from typing import Any
 from .archive import rebuild_day_archive
 from .config import Settings
 from .database import Database
-from .ffmpeg_tools import extract_cropped_frame, remux_elementary_stream
+from .ffmpeg_tools import (
+    extract_cropped_frame,
+    extract_roi_and_full_frame,
+    remux_elementary_stream,
+)
+
+_DEFAULT_EXTRACT_CROPPED_FRAME = extract_cropped_frame
 
 
 @dataclass(frozen=True)
@@ -38,20 +45,29 @@ class MultipartPart:
     data: bytes
 
 
-def parse_multipart(body: bytes, boundary: str) -> list[MultipartPart]:
-    """手写 multipart/form-data 解析器。
+@dataclass(frozen=True)
+class MultipartSpan:
+    name: str
+    filename: str | None
+    content_type: str
+    start: int
+    end: int
+
+
+def parse_multipart_spans(body: bytes, boundary: str) -> list[MultipartSpan]:
+    """零拷贝 multipart/form-data 索引解析器 (仅返回各 part 在 body 中的起止偏移)。
 
     body 必须符合 RFC 2046 结构:
         --boundary CRLF
         headers CRLF
         CRLF content CRLF
         --boundary--
-    返回所有 part; 解析失败抛 ValueError。只处理 content-disposition 字段。
+    解析失败抛 ValueError。只处理 content-disposition / content-type 字段。
     """
     if not boundary:
         raise ValueError("empty boundary")
     delim = b"--" + boundary.encode("utf-8")
-    parts: list[MultipartPart] = []
+    spans: list[MultipartSpan] = []
     pos = 0
     scanned = 0
     while True:
@@ -70,16 +86,39 @@ def parse_multipart(body: bytes, boundary: str) -> list[MultipartPart]:
         if content_end < 0:
             raise ValueError("multipart part unterminated")
         # 与边界前的 \r\n 分隔符精确切掉 2 字节 (视频二进制可能以任意字节结尾)
-        content = body[header_end + 4 : content_end - 2]
-        parts.append(_part_from_headers(headers_raw, content))
+        content_start = header_end + 4
+        data_end = max(content_start, content_end - 2)
+        name, filename, content_type = _parse_part_headers(headers_raw)
+        spans.append(
+            MultipartSpan(
+                name=name,
+                filename=filename,
+                content_type=content_type,
+                start=content_start,
+                end=data_end,
+            )
+        )
         scanned += 1
         if scanned > 1000:
             raise ValueError("too many multipart parts")
         pos = content_end
-    return parts
+    return spans
 
 
-def _part_from_headers(headers_raw: str, content: bytes) -> MultipartPart:
+def parse_multipart(body: bytes, boundary: str) -> list[MultipartPart]:
+    """手写 multipart/form-data 解析器 (返回拷贝后的 bytes 载荷)。"""
+    return [
+        MultipartPart(
+            name=span.name,
+            filename=span.filename,
+            content_type=span.content_type,
+            data=body[span.start : span.end],
+        )
+        for span in parse_multipart_spans(body, boundary)
+    ]
+
+
+def _parse_part_headers(headers_raw: str) -> tuple[str, str | None, str]:
     name = ""
     filename: str | None = None
     content_type = ""
@@ -96,7 +135,7 @@ def _part_from_headers(headers_raw: str, content: bytes) -> MultipartPart:
                     filename = value or None
         elif line.lower().startswith("content-type:"):
             content_type = line.split(":", 1)[1].strip()
-    return MultipartPart(name=name, filename=filename, content_type=content_type, data=content)
+    return name, filename, content_type
 
 
 # 板端 meta 必须携带的字段。
@@ -167,22 +206,39 @@ class IngestSpool:
     def spool(
         self,
         meta: dict[str, Any],
-        video: bytes,
+        video: bytes | bytearray | memoryview,
         meta_filename: str = "meta.json",
-        audio: bytes | None = None,
+        audio: bytes | bytearray | memoryview | None = None,
         audio_name: str | None = None,
     ) -> Path:
         key = ingest_event_key(meta)
         job_dir = self.pending_dir / key
-        job_dir.mkdir(parents=True, exist_ok=True)
-        meta_path = job_dir / meta_filename
-        meta_path.write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        if job_dir.is_dir():
+            return job_dir
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=f".staging-{key}-", dir=self.pending_dir)
         )
-        video_name = _video_filename(meta)
-        (job_dir / video_name).write_bytes(video)
-        if audio is not None and audio_name:
-            (job_dir / audio_name).write_bytes(audio)
+        try:
+            meta_path = staging_dir / meta_filename
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            video_name = _video_filename(meta)
+            with (staging_dir / video_name).open("wb") as handle:
+                handle.write(video)
+            if audio is not None and audio_name:
+                with (staging_dir / audio_name).open("wb") as handle:
+                    handle.write(audio)
+            try:
+                os.replace(staging_dir, job_dir)
+            except OSError:
+                if job_dir.is_dir():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    return job_dir
+                raise
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
         return job_dir
 
     @staticmethod
@@ -211,7 +267,11 @@ class IngestSpool:
 
     def pending_jobs(self) -> list[Path]:
         return sorted(
-            [entry for entry in self.pending_dir.iterdir() if entry.is_dir()],
+            [
+                entry
+                for entry in self.pending_dir.iterdir()
+                if entry.is_dir() and not entry.name.startswith(".")
+            ],
             key=lambda path: path.name,
         )
 
@@ -455,20 +515,61 @@ def _normalized_board_roi(
     return roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top
 
 
+async def _remux_with_audio_fallback(
+    settings: Settings,
+    video_path: Path,
+    audio_path: Path | None,
+    meta: dict[str, Any],
+    output_path: Path,
+    *,
+    key: str,
+    creation_time: datetime,
+) -> None:
+    audio_demux = _audio_demux(meta) if audio_path is not None else None
+    try:
+        await remux_elementary_stream(
+            settings,
+            video_path,
+            output_path,
+            es_format=_es_format(meta.get("codec")),
+            audio_path=audio_path,
+            audio_format=audio_demux[0] if audio_demux else None,
+            audio_rate=audio_demux[1] if audio_demux else None,
+            audio_channels=audio_demux[2] if audio_demux else None,
+            creation_time=creation_time,
+        )
+    except RuntimeError:
+        # 音频裸流损坏/编码误判时降级为纯视频重封装, 不阻塞片段保存。
+        if audio_path is None:
+            raise
+        print(
+            f"[INGEST] remux with audio failed for {key}; retrying video-only",
+            flush=True,
+        )
+        await remux_elementary_stream(
+            settings,
+            video_path,
+            output_path,
+            es_format=_es_format(meta.get("codec")),
+            creation_time=creation_time,
+        )
+
+
 async def _verify_probable_clip(
     settings: Settings,
     video_path: Path,
     meta: dict[str, Any],
     detector: Any,
     job_key: str = "",
+    *,
+    mp4_path: Path | None = None,
 ) -> tuple[bool, str, Any]:
     """对板端上传切片自身抽帧校验是否含儿童证据。
 
     上传物是裸 Annex-B 基本流 (无容器时间戳), ffmpeg -ss 输入侧寻址
-    对其无效 —— 先零拷贝重封装为 MP4 (c:v copy, 容器级操作) 再按轨迹
-    ROI 均匀抽 5 帧, 交给 DaughterDetector.verify_board_probable_paths:
-    儿童人脸/ONNX 证据接受; 连续成人脸或无人在场拒绝; 无脸但人物稳定
-    且板端分数强则按高召回放行。返回 (accepted, decision)。
+    对其无效 —— 若调用方未提供已重封装的 mp4_path 且源非 .mp4, 先零拷贝
+    重封装为 MP4, 再按轨迹 ROI 均匀抽 5 帧 (单次解码同时产出 ROI 裁切帧
+    与整帧, 回退无需二次启动 ffmpeg)。返回 (accepted, decision, verification)。
     """
     roi = _normalized_board_roi(
         meta,
@@ -483,28 +584,54 @@ async def _verify_probable_clip(
     if duration <= 0:
         return True, "invalid_duration_fallback", None
     with tempfile.TemporaryDirectory(prefix="nas-video-clip-verify-") as temp_dir:
-        mp4_path = Path(temp_dir) / "clip.mp4"
-        try:
-            await remux_elementary_stream(settings, video_path, mp4_path)
-        except Exception as exc:
-            print(f"[INGEST] verify remux failed: {exc}", flush=True)
-            return True, "remux_failed_fallback", None
-        if not mp4_path.exists() or mp4_path.stat().st_size == 0:
+        if mp4_path is not None:
+            source_mp4 = mp4_path
+        elif video_path.suffix.lower() == ".mp4":
+            source_mp4 = video_path
+        else:
+            source_mp4 = Path(temp_dir) / "clip.mp4"
+            try:
+                await remux_elementary_stream(
+                    settings,
+                    video_path,
+                    source_mp4,
+                    es_format=_es_format(meta.get("codec")),
+                )
+            except Exception as exc:
+                print(f"[INGEST] verify remux failed: {exc}", flush=True)
+                return True, "remux_failed_fallback", None
+        if not source_mp4.exists() or source_mp4.stat().st_size == 0:
             return True, "empty_remux_fallback", None
         offsets = [duration * fraction for fraction in (0.15, 0.3, 0.5, 0.7, 0.85)]
-        frames = []
+        frames: list[Path] = []
+        full_frames_cached: list[Path] = []
+        use_dual_extract = extract_cropped_frame is _DEFAULT_EXTRACT_CROPPED_FRAME
         for index, offset in enumerate(offsets, start=1):
-            frame_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
-            await extract_cropped_frame(
-                settings,
-                mp4_path,
-                frame_path,
-                offset,
-                roi=roi,
-                output_width=settings.rv1106_verify_frame_width,
-            )
-            if frame_path.exists():
-                frames.append(frame_path)
+            roi_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
+            full_path = Path(temp_dir) / f"clip-full-{index}.jpg"
+            if use_dual_extract:
+                await extract_roi_and_full_frame(
+                    settings,
+                    source_mp4,
+                    roi_path,
+                    full_path,
+                    offset,
+                    roi=roi,
+                    output_width=settings.rv1106_verify_frame_width,
+                )
+                if full_path.exists():
+                    full_frames_cached.append(full_path)
+            else:
+                await extract_cropped_frame(
+                    settings,
+                    source_mp4,
+                    roi_path,
+                    offset,
+                    roi=roi,
+                    output_width=settings.rv1106_verify_frame_width,
+                )
+            if roi_path.exists():
+                frames.append(roi_path)
         if not frames:
             # 切片解不出帧: 无法证伪, 宁多存。
             return True, "no_frames_fallback", None
@@ -534,19 +661,20 @@ async def _verify_probable_clip(
             # (实测 box 落在右边缘白墙, ROI 裁剪 person_score 恒为 0),
             # 此时 ROI 校验必然 no_person。回退整帧校验, 避免因板端框
             # 不可靠而把真实在场景内的片段全部丢弃。
-            full_frames = []
-            for index, offset in enumerate(offsets, start=1):
-                frame_path = Path(temp_dir) / f"clip-full-{index}.jpg"
-                await extract_cropped_frame(
-                    settings,
-                    mp4_path,
-                    frame_path,
-                    offset,
-                    roi=(0.0, 0.0, 1.0, 1.0),
-                    output_width=settings.rv1106_verify_frame_width,
-                )
-                if frame_path.exists():
-                    full_frames.append(frame_path)
+            full_frames = full_frames_cached
+            if not full_frames:
+                for index, offset in enumerate(offsets, start=1):
+                    frame_path = Path(temp_dir) / f"clip-full-{index}.jpg"
+                    await extract_cropped_frame(
+                        settings,
+                        source_mp4,
+                        frame_path,
+                        offset,
+                        roi=(0.0, 0.0, 1.0, 1.0),
+                        output_width=settings.rv1106_verify_frame_width,
+                    )
+                    if frame_path.exists():
+                        full_frames.append(frame_path)
             if full_frames:
                 # 2026-11-05 收紧: faceless_person 只证明"画面里有人", 不证明
                 # "画面里是小孩"。整帧回退若照单全收, 会把"只有大人"的片段
@@ -649,44 +777,123 @@ async def save_ingested_clip(
     if identity != "confirmed" and settings.rv1106_probable_policy == "reject":
         spool.remove(job_dir)
         return None
+    audio_path = spool.job_audio_path(job_dir, meta)
+    # 拍摄时刻写入 MP4 creation_time, 供 Nextcloud/Immich 正确按天归档
+    clip_creation = datetime.fromtimestamp(
+        float(meta["clip_start"]), tz=timezone.utc
+    )
+
     # 儿童证据分 (Q4): confirmed=1.0 (板端人脸命中); probable 经 NAS 安检
     # 按证据映射; 校验器缺失等 fail-open 取中性偏宽 0.5。
     child_evidence = 1.0 if identity == "confirmed" else None
     verify_decision = None
-    if (
-        identity != "confirmed"
-        and settings.rv1106_probable_policy == "verify"
-    ):
-        if probable_verifier is None:
-            # 校验器不可用 (OpenCV/模型缺失): 宁多存, 放行并留痕。
-            child_evidence = 0.5
-            print(
-                f"[INGEST] verify skipped (no verifier) {key}; accepting",
-                flush=True,
-            )
-        else:
-            accepted, decision, verification = await _verify_probable_clip(
-                settings, video_path, meta, probable_verifier, job_key=key
-            )
-            verify_decision = decision
-            if not accepted:
+    pre_remux_dir: tempfile.TemporaryDirectory[str] | None = None
+    pre_remuxed_mp4: Path | None = None
+    try:
+        if (
+            identity != "confirmed"
+            and settings.rv1106_probable_policy == "verify"
+        ):
+            if probable_verifier is None:
+                # 校验器不可用 (OpenCV/模型缺失): 宁多存, 放行并留痕。
+                child_evidence = 0.5
                 print(
-                    f"[INGEST] verify reject {key} decision={decision}",
+                    f"[INGEST] verify skipped (no verifier) {key}; accepting",
                     flush=True,
                 )
-                if getattr(settings, "rv1106_keep_rejected", False):
-                    spool.archive_rejected(job_dir, decision, meta)
-                    spool.prune_rejected(
-                        int(getattr(settings, "rv1106_rejected_retention_days", 7))
+            else:
+                # 预封装一次并复用于后续发布, 避免 probable 片段被 ffmpeg 重封装两次;
+                # 暂存在 spool.root 下, 校验拒绝时不会在 Nextcloud 目录留下空日期文件夹。
+                pre_remux_dir = tempfile.TemporaryDirectory(
+                    prefix=".nas-video-verify-remux-", dir=spool.root
+                )
+                candidate_mp4 = Path(pre_remux_dir.name) / "clip.mp4"
+                try:
+                    await _remux_with_audio_fallback(
+                        settings,
+                        video_path,
+                        audio_path,
+                        meta,
+                        candidate_mp4,
+                        key=key,
+                        creation_time=clip_creation,
                     )
-                else:
-                    spool.remove(job_dir)
-                return None
-            if decision in {"child_face", "daughter_onnx"}:
-                child_evidence = 1.0
-            elif decision == "faceless_person":
-                child_evidence = 0.6
-            print(f"[INGEST] verify accept {key} decision={decision}", flush=True)
+                    if candidate_mp4.exists() and candidate_mp4.stat().st_size > 0:
+                        pre_remuxed_mp4 = candidate_mp4
+                except Exception as exc:
+                    print(f"[INGEST] verify remux failed: {exc}", flush=True)
+                    pre_remuxed_mp4 = None
+                accepted, decision, verification = await _verify_probable_clip(
+                    settings,
+                    video_path,
+                    meta,
+                    probable_verifier,
+                    job_key=key,
+                    mp4_path=pre_remuxed_mp4,
+                )
+                verify_decision = decision
+                if not accepted:
+                    print(
+                        f"[INGEST] verify reject {key} decision={decision}",
+                        flush=True,
+                    )
+                    if getattr(settings, "rv1106_keep_rejected", False):
+                        spool.archive_rejected(job_dir, decision, meta)
+                        spool.prune_rejected(
+                            int(getattr(settings, "rv1106_rejected_retention_days", 7))
+                        )
+                    else:
+                        spool.remove(job_dir)
+                    return None
+                if decision in {"child_face", "daughter_onnx"}:
+                    child_evidence = 1.0
+                elif decision == "faceless_person":
+                    child_evidence = 0.6
+                print(f"[INGEST] verify accept {key} decision={decision}", flush=True)
+        return await _finalize_ingested_clip(
+            settings=settings,
+            database=database,
+            spool=spool,
+            job_dir=job_dir,
+            meta=meta,
+            key=key,
+            video_path=video_path,
+            audio_path=audio_path,
+            clip_creation=clip_creation,
+            identity=identity,
+            camera_name=camera_name,
+            display_clip_start=display_clip_start,
+            display_clip_end=display_clip_end,
+            day=day,
+            child_evidence=child_evidence,
+            verify_decision=verify_decision,
+            pre_remuxed_mp4=pre_remuxed_mp4,
+        )
+    finally:
+        if pre_remux_dir is not None:
+            pre_remux_dir.cleanup()
+
+
+async def _finalize_ingested_clip(
+    *,
+    settings: Settings,
+    database: Database,
+    spool: IngestSpool,
+    job_dir: Path,
+    meta: dict[str, Any],
+    key: str,
+    video_path: Path,
+    audio_path: Path | None,
+    clip_creation: datetime,
+    identity: str,
+    camera_name: str,
+    display_clip_start: datetime,
+    display_clip_end: datetime,
+    day: str,
+    child_evidence: float | None,
+    verify_decision: str | None,
+    pre_remuxed_mp4: Path | None,
+) -> int | None:
     if child_evidence is None:
         # policy=accept: 信任板端判定, 无 NAS 证据时取中性偏宽。
         child_evidence = 0.5
@@ -788,42 +995,90 @@ async def save_ingested_clip(
         prefix=".nas-video-staged-", dir=day_dir
     ) as staging_dir:
         staged_clip_path = Path(staging_dir) / clip_path.name
-        audio_path = spool.job_audio_path(job_dir, meta)
-        audio_demux = _audio_demux(meta) if audio_path is not None else None
-        # 拍摄时刻写入 MP4 creation_time, 供 Nextcloud/Immich 正确按天归档
-        clip_creation = datetime.fromtimestamp(
-            float(meta["clip_start"]), tz=timezone.utc
-        )
-        try:
-            await remux_elementary_stream(
+        if pre_remuxed_mp4 is not None and pre_remuxed_mp4.exists():
+            # 复用校验阶段已封装好的 MP4, 跳过第二次 ffmpeg 封装
+            shutil.copy2(pre_remuxed_mp4, staged_clip_path)
+        else:
+            await _remux_with_audio_fallback(
                 settings,
                 video_path,
+                audio_path,
+                meta,
                 staged_clip_path,
-                es_format=_es_format(meta.get("codec")),
-                audio_path=audio_path,
-                audio_format=audio_demux[0] if audio_demux else None,
-                audio_rate=audio_demux[1] if audio_demux else None,
-                audio_channels=audio_demux[2] if audio_demux else None,
-                creation_time=clip_creation,
-            )
-        except RuntimeError:
-            # 音频裸流损坏/编码误判时降级为纯视频重封装, 不阻塞片段保存。
-            if audio_path is None:
-                raise
-            print(
-                f"[INGEST] remux with audio failed for {key}; retrying video-only",
-                flush=True,
-            )
-            await remux_elementary_stream(
-                settings,
-                video_path,
-                staged_clip_path,
-                es_format=_es_format(meta.get("codec")),
+                key=key,
                 creation_time=clip_creation,
             )
         os.replace(staged_clip_path, clip_path)
 
-    # 新片段已安全落盘; 现在移除被替换的最弱片段 (文件 + DB 记录)。
+    moment_id: int | None = None
+    try:
+        metadata = {
+            "schema_version": 3,
+            "owner": "nas",
+            "camera_name": camera_name,
+            "analysis_backend": "rv1106_edge",
+            "category": category,
+            "title": title,
+            "summary": summary,
+            "tags": tags,
+            "confidence": min(1.0, max(0.0, score)),
+            "selection_score": selection_score,
+            "keep_consistency_repaired": False,
+            "local_child_confirmed": verified_child_face,
+            "local_child_score": child_evidence,
+            "source": "board_high_ring",
+            "source_stream_role": "board",
+            "source_started_at": display_clip_start.isoformat(timespec="seconds"),
+            "source_ended_at": display_clip_end.isoformat(timespec="seconds"),
+            "clip_start": display_clip_start.isoformat(timespec="seconds"),
+            "clip_end": display_clip_end.isoformat(timespec="seconds"),
+            "clip_duration_seconds": max(
+                1.0, (display_clip_end - display_clip_start).total_seconds()
+            ),
+            "source_paths": [str(video_path)],
+            "model_raw": meta,
+            "event_id": None,
+            "event_key": key,
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        moment_id = database.create_moment(
+            camera_name=camera_name,
+            title=title,
+            summary=summary,
+            tags=tags,
+            confidence=score,
+            source_low_segment_id=None,
+            source_started_at=display_clip_start.isoformat(timespec="seconds"),
+            source_ended_at=display_clip_end.isoformat(timespec="seconds"),
+            clip_path=clip_path,
+            metadata_path=metadata_path,
+            analysis_backend="rv1106_edge",
+            category=category,
+            selection_score=selection_score,
+            clip_started_at=display_clip_start.isoformat(timespec="seconds"),
+            clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
+            trigger_key=key,
+            source_segment_id=None,
+            source_stream_role="board",
+        )
+        metadata["event_id"] = moment_id
+        metadata["daily_summary_path"] = str(day_dir / "summary.md")
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        database.record_ingested_done(key, moment_id)
+    except Exception:
+        if moment_id is not None:
+            database.delete_moment_record(moment_id)
+        Path(clip_path).unlink(missing_ok=True)
+        Path(metadata_path).unlink(missing_ok=True)
+        raise
+
+    # 新片段已安全落盘并登记入库; 现在才移除被替换的最弱片段,
+    # 防止写入/入库异常时新旧片段一起丢失。
     for evict_moment in evictions:
         for path_key in ("clip_path", "metadata_path"):
             path = evict_moment.get(path_key)
@@ -831,66 +1086,8 @@ async def save_ingested_clip(
                 Path(path).unlink(missing_ok=True)
         database.delete_moment_record(evict_moment["id"])
 
-    try:
-            metadata = {
-                "schema_version": 3,
-                "owner": "nas",
-                "camera_name": camera_name,
-                "analysis_backend": "rv1106_edge",
-                "category": category,
-                "title": title,
-                "summary": summary,
-                "tags": tags,
-                "confidence": min(1.0, max(0.0, score)),
-                "selection_score": selection_score,
-                "keep_consistency_repaired": False,
-                "local_child_confirmed": verified_child_face,
-                "local_child_score": child_evidence,
-                "source": "board_high_ring",
-                "source_stream_role": "board",
-                "source_started_at": display_clip_start.isoformat(timespec="seconds"),
-                "source_ended_at": display_clip_end.isoformat(timespec="seconds"),
-                "clip_start": display_clip_start.isoformat(timespec="seconds"),
-                "clip_end": display_clip_end.isoformat(timespec="seconds"),
-                "clip_duration_seconds": max(1.0, (display_clip_end - display_clip_start).total_seconds()),
-                "source_paths": [str(video_path)],
-                "model_raw": meta,
-                "event_id": None,
-                "event_key": key,
-            }
-            metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-
-            moment_id = database.create_moment(
-                camera_name=camera_name,
-                title=title,
-                summary=summary,
-                tags=tags,
-                confidence=score,
-                source_low_segment_id=None,
-                source_started_at=display_clip_start.isoformat(timespec="seconds"),
-                source_ended_at=display_clip_end.isoformat(timespec="seconds"),
-                clip_path=clip_path,
-                metadata_path=metadata_path,
-                analysis_backend="rv1106_edge",
-                category=category,
-                selection_score=selection_score,
-                clip_started_at=display_clip_start.isoformat(timespec="seconds"),
-                clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
-                trigger_key=key,
-                source_segment_id=None,
-                source_stream_role="board",
-            )
-            metadata["event_id"] = moment_id
-            metadata["daily_summary_path"] = str(day_dir / "summary.md")
-            metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-
-            rebuild_day_archive(settings, database, day)
-            database.record_ingested_done(key, moment_id)
-            spool.remove(job_dir)
-    except Exception:
-        Path(clip_path).unlink(missing_ok=True)
-        Path(metadata_path).unlink(missing_ok=True)
-        raise
+    rebuild_day_archive(settings, database, day)
+    spool.remove(job_dir)
     return moment_id
 
 
