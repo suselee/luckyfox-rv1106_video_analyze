@@ -280,3 +280,101 @@ def test_preview_jpeg_caches_and_serves_image(tmp_path, monkeypatch):
     assert status2 == [200]
     assert handler2.wfile.getvalue() == b"\xff\xd8\xff\xe0fake-jpeg"
     assert len(calls) == 1
+
+
+
+def test_rejected_rescue_publishes_moment_and_is_idempotent(tmp_path, monkeypatch):
+    base = load_settings("/nonexistent.env")
+    settings = replace(
+        base,
+        data_dir=tmp_path / "var",
+        output_dir=tmp_path / "out",
+        board_ingest_dir=tmp_path / "board_ingest",
+    )
+    database = Database(tmp_path / "app.sqlite3")
+    database.migrate()
+
+    entry = settings.board_ingest_dir / "rejected" / "20261126-101500_rescue01"
+    entry.mkdir(parents=True)
+    (entry / "clip.hevc").write_bytes(b"hevc-stream")
+    (entry / "decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "face_without_child",
+                "archived_at": "2026-11-26T10:15:10",
+                "meta": {
+                    "identity": "probable",
+                    "score": 0.81,
+                    "camera_id": "living-room",
+                    "codec": "H265",
+                    "clip_start": 1764123300.0,
+                    "clip_end": 1764123320.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    remux_calls = []
+
+    def fake_remux(settings_, video_path, audio_path, meta, output_path, *, creation_time):
+        remux_calls.append((video_path.name, creation_time))
+        output_path.write_bytes(b"rescued-mp4-bytes")
+
+    monkeypatch.setattr(app_module, "_remux_rejected_clip_sync", fake_remux)
+
+    # First rescue publishes MP4 + JSON + DB moment + daughter feedback
+    handler1, statuses1, _ = _make_handler(
+        settings,
+        database,
+        path="/api/rejected/20261126-101500_rescue01/rescue",
+        body=b"{}",
+    )
+    handler1.do_POST()
+    assert statuses1 == [200]
+    resp1 = json.loads(handler1.wfile.getvalue().decode("utf-8"))
+    assert resp1["rescued"] is True
+    assert resp1["already_rescued"] is False
+    moment_id = resp1["moment_id"]
+    assert len(remux_calls) == 1
+
+    moment = database.get_moment(moment_id)
+    assert moment is not None
+    assert moment["category"] == "rv1106_rescued"
+    assert moment["trigger_key"] == "rescued:20261126-101500_rescue01"
+    assert Path(moment["clip_path"]).read_bytes() == b"rescued-mp4-bytes"
+    assert Path(moment["metadata_path"]).is_file()
+    day_dir = Path(moment["clip_path"]).parent
+    assert (day_dir / "manifest.json").is_file()
+    assert (day_dir / "summary.md").is_file()
+
+    # Rejected list marks it as rescued & labeled daughter
+    items = _rejected_api_payload(settings, database, 20)
+    assert items[0]["rescued"] is True
+    assert items[0]["rescued_moment_id"] == moment_id
+    assert items[0]["feedback_label"] == "daughter"
+
+    # Second rescue is idempotent and does not call remux again
+    handler2, statuses2, _ = _make_handler(
+        settings,
+        database,
+        path="/api/rejected/20261126-101500_rescue01/rescue",
+        body=b"{}",
+    )
+    handler2.do_POST()
+    assert statuses2 == [200]
+    resp2 = json.loads(handler2.wfile.getvalue().decode("utf-8"))
+    assert resp2["already_rescued"] is True
+    assert resp2["moment_id"] == moment_id
+    assert len(remux_calls) == 1
+    assert len(database.list_moments(limit=20)) == 1
+
+    # Traversal attempt returns 404
+    handler3, statuses3, _ = _make_handler(
+        settings,
+        database,
+        path="/api/rejected/..%2Fetc/rescue",
+        body=b"{}",
+    )
+    handler3.do_POST()
+    assert statuses3 == [404]

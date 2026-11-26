@@ -176,6 +176,21 @@ h2 {
   color: #ffffff;
 }
 
+.button.active-rescued,
+.button.active-rescued:disabled {
+  border-color: #15803d;
+  background: #ecfdf3;
+  color: #15803d;
+  cursor: default;
+  opacity: 0.9;
+}
+
+.rescue-btn {
+  width: 100%;
+  min-height: 36px;
+  font-size: 14px;
+}
+
 .status-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

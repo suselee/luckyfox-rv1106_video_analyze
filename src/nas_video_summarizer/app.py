@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,9 +28,14 @@ from .database import (
     VALID_FEEDBACK_LABELS,
     moment_feedback_key,
 )
+from .ffmpeg_tools import build_remux_elementary_stream_command
 from .ingest import (
     IngestSpool,
+    _audio_demux,
+    _es_format,
     _plan_verify_targets,
+    _slugify,
+    _unique_path,
     ingest_event_key,
     parse_multipart_spans,
     validate_meta,
@@ -218,6 +224,243 @@ def _rejected_video_path(entry: Path) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def _rejected_audio_path(entry: Path) -> Path | None:
+    for filename in _AUDIO_FILENAMES:
+        candidate = entry / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _remux_rejected_clip_sync(
+    settings: Settings,
+    video_path: Path,
+    audio_path: Path | None,
+    meta: dict[str, Any],
+    output_path: Path,
+    *,
+    creation_time: datetime,
+) -> None:
+    """同步将 rejected 目录下的视频重封装 (或无损复制) 为标准 MP4。"""
+    suffix = video_path.suffix.lower()
+    if suffix == ".mp4" and audio_path is None:
+        shutil.copy2(video_path, output_path)
+        return
+
+    es_format = _es_format(meta.get("codec"))
+    if es_format is None and suffix in {".hevc", ".h265"}:
+        es_format = "hevc"
+    elif es_format is None and suffix == ".h264":
+        es_format = "h264"
+
+    audio_demux = _audio_demux(meta) if audio_path is not None else None
+    cmd = build_remux_elementary_stream_command(
+        settings,
+        video_path,
+        output_path,
+        es_format=es_format,
+        audio_path=audio_path if audio_demux else None,
+        audio_format=audio_demux[0] if audio_demux else None,
+        audio_rate=audio_demux[1] if audio_demux else None,
+        audio_channels=audio_demux[2] if audio_demux else None,
+        creation_time=creation_time,
+    )
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        timeout=60,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0 and audio_path is not None and audio_demux is not None:
+        cmd_video_only = build_remux_elementary_stream_command(
+            settings,
+            video_path,
+            output_path,
+            es_format=es_format,
+            creation_time=creation_time,
+        )
+        proc = subprocess.run(
+            cmd_video_only,
+            check=False,
+            timeout=60,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    if proc.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg rescue remux failed: {err or proc.returncode}")
+
+
+def _rescue_rejected_timestamps(
+    meta: dict[str, Any], archived_at: str, video_path: Path
+) -> tuple[float, float]:
+    try:
+        start_ts = float(meta.get("clip_start") or 0.0)
+        end_ts = float(meta.get("clip_end") or 0.0)
+        if start_ts > 0.0 and end_ts > start_ts:
+            return start_ts, end_ts
+    except (TypeError, ValueError):
+        pass
+    if archived_at:
+        try:
+            dt = datetime.fromisoformat(archived_at)
+            start_ts = dt.timestamp()
+            return start_ts, start_ts + 20.0
+        except ValueError:
+            pass
+    start_ts = video_path.stat().st_mtime
+    return start_ts, start_ts + 20.0
+
+
+def _rescue_rejected_entry(
+    settings: Settings, database: Database, entry: Path
+) -> dict[str, Any]:
+    """将被拒队列中的视频一键捞回保存到 Nextcloud 目录并入库 (幂等)。"""
+    trigger_key = f"rescued:{entry.name}"
+    existing = database.get_moment_by_trigger_key(trigger_key)
+    if existing is not None:
+        return {
+            "name": entry.name,
+            "rescued": True,
+            "already_rescued": True,
+            "moment_id": int(existing["id"]),
+            "clip_path": str(existing["clip_path"]),
+            "summary": database.feedback_summary(),
+        }
+
+    video_path = _rejected_video_path(entry)
+    if video_path is None:
+        raise FileNotFoundError("rejected video not found")
+    audio_path = _rejected_audio_path(entry)
+    decision, archived_at, meta = _rejected_info(entry)
+
+    start_ts, end_ts = _rescue_rejected_timestamps(meta, archived_at, video_path)
+    clip_start_dt = datetime.fromtimestamp(start_ts).astimezone()
+    clip_end_dt = datetime.fromtimestamp(end_ts).astimezone()
+    display_offset = timedelta(seconds=settings.camera_time_offset_seconds)
+    display_clip_start = clip_start_dt + display_offset
+    display_clip_end = clip_end_dt + display_offset
+    day = display_clip_start.strftime("%Y-%m-%d")
+    clip_creation = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+
+    camera_name = str(meta.get("camera_id") or settings.camera_name)
+    score = min(1.0, max(0.0, float(meta.get("score") or 0.9)))
+    title = "Rescued daughter moment"
+    summary = f"从被拒队列人工捞回保存（原拒因: {decision}）。"
+    tags = ["daughter", "rv1106", "rescued"]
+    category = "rv1106_rescued"
+
+    day_dir = settings.output_dir / day
+    day_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = _unique_path(
+        day_dir / f"{display_clip_start.strftime('%H%M%S')}_{_slugify(title)}.mp4"
+    )
+    metadata_path = clip_path.with_suffix(".json")
+
+    with tempfile.TemporaryDirectory(
+        prefix=".nas-video-rescue-", dir=day_dir
+    ) as staging_dir:
+        staged_clip = Path(staging_dir) / clip_path.name
+        _remux_rejected_clip_sync(
+            settings,
+            video_path,
+            audio_path,
+            meta,
+            staged_clip,
+            creation_time=clip_creation,
+        )
+        os.replace(staged_clip, clip_path)
+
+    moment_id: int | None = None
+    try:
+        metadata = {
+            "schema_version": 3,
+            "owner": "nas",
+            "camera_name": camera_name,
+            "analysis_backend": "rv1106_edge",
+            "category": category,
+            "title": title,
+            "summary": summary,
+            "tags": tags,
+            "confidence": score,
+            "selection_score": 1.0,
+            "keep_consistency_repaired": False,
+            "local_child_confirmed": True,
+            "local_child_score": 1.0,
+            "source": "rescued_rejected",
+            "source_stream_role": "board",
+            "source_started_at": display_clip_start.isoformat(timespec="seconds"),
+            "source_ended_at": display_clip_end.isoformat(timespec="seconds"),
+            "clip_start": display_clip_start.isoformat(timespec="seconds"),
+            "clip_end": display_clip_end.isoformat(timespec="seconds"),
+            "clip_duration_seconds": max(
+                1.0, (display_clip_end - display_clip_start).total_seconds()
+            ),
+            "source_paths": [str(video_path)],
+            "model_raw": meta,
+            "rescued_from": entry.name,
+            "original_decision": decision,
+            "event_id": None,
+            "event_key": trigger_key,
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        moment_id = database.create_moment(
+            camera_name=camera_name,
+            title=title,
+            summary=summary,
+            tags=tags,
+            confidence=score,
+            source_low_segment_id=None,
+            source_started_at=display_clip_start.isoformat(timespec="seconds"),
+            source_ended_at=display_clip_end.isoformat(timespec="seconds"),
+            clip_path=clip_path,
+            metadata_path=metadata_path,
+            analysis_backend="rv1106_edge",
+            category=category,
+            selection_score=1.0,
+            clip_started_at=display_clip_start.isoformat(timespec="seconds"),
+            clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
+            trigger_key=trigger_key,
+            source_segment_id=None,
+            source_stream_role="board",
+        )
+        metadata["event_id"] = moment_id
+        metadata["daily_summary_path"] = str(day_dir / "summary.md")
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        if moment_id is not None:
+            database.delete_moment_record(moment_id)
+        clip_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        raise
+
+    rebuild_day_archive(settings, database, day)
+    database.upsert_clip_feedback(
+        source="rejected",
+        item_key=f"rejected:{entry.name}",
+        label="daughter",
+        moment_id=moment_id,
+        deleted_clip=False,
+        clip_path=str(video_path),
+        meta=meta,
+        day=day,
+        category=decision,
+    )
+    return {
+        "name": entry.name,
+        "rescued": True,
+        "already_rescued": False,
+        "moment_id": moment_id,
+        "clip_path": str(clip_path),
+        "summary": database.feedback_summary(),
+    }
 
 
 def _rejected_info(entry: Path) -> tuple[str, str, dict[str, Any]]:
@@ -494,10 +737,16 @@ def _rejected_api_payload(
             }
         )
     feedback_map = database.get_feedback_map([item["feedback_key"] for item in items])
+    rescued_map = database.get_moment_ids_by_trigger_keys(
+        [f"rescued:{item['name']}" for item in items]
+    )
     for item in items:
         fb = feedback_map.get(item["feedback_key"])
         if fb:
             item["feedback_label"] = fb["label"]
+        rescued_id = rescued_map.get(f"rescued:{item['name']}")
+        item["rescued_moment_id"] = rescued_id
+        item["rescued"] = rescued_id is not None
     return items
 
 
@@ -590,6 +839,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         rejected_name = _rejected_name_from_path(path, "/feedback")
         if rejected_name is not None:
             self._handle_rejected_feedback(rejected_name)
+            return
+
+        rescue_name = _rejected_name_from_path(path, "/rescue")
+        if rescue_name is not None:
+            self._handle_rejected_rescue(rescue_name)
             return
 
         moment_id = _moment_id_from_path(path, "/favorite")
@@ -726,6 +980,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "summary": self.state.database.feedback_summary(),
             }
         )
+
+    def _handle_rejected_rescue(self, name: str) -> None:
+        entry = _safe_rejected_entry(self.state.settings, name)
+        if entry is None:
+            self._send_error_json(HTTPStatus.NOT_FOUND, "rejected clip not found")
+            return
+        try:
+            result = _rescue_rejected_entry(
+                self.state.settings, self.state.database, entry
+            )
+        except FileNotFoundError:
+            self._send_error_json(HTTPStatus.NOT_FOUND, "rejected video not found")
+            return
+        except Exception as exc:
+            self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"rescue failed: {exc}"
+            )
+            return
+        self._send_json(result)
 
     def _handle_board_ingest(self) -> None:
         """接收 RV1106 板端 multipart 上传 (meta JSON + 4K 基本流片段)。"""

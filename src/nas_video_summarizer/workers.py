@@ -867,7 +867,7 @@ class Supervisor:
         face_verified = bool(
             verification_details
             and verification_details.get("decision")
-            in {"child_face", "daughter_onnx"}
+            in {"child_face", "daughter_onnx", "daughter_face"}
         )
         base_selection_score = min(1.0, score * 0.75 + activity_score * 0.25)
         selection_score = (
@@ -994,7 +994,7 @@ class Supervisor:
     ) -> None:
         if verification.accepted:
             self._probable_verified += 1
-            if verification.decision in {"child_face", "daughter_onnx"}:
+            if verification.decision in {"child_face", "daughter_onnx", "daughter_face"}:
                 self._probable_face_verified += 1
             elif verification.decision == "faceless_person":
                 self._probable_faceless_accepted += 1

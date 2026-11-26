@@ -8,6 +8,7 @@ from statistics import mean, median
 from .analysis import ClipCandidate
 from .config import Settings
 from .ffmpeg_tools import SampledFrame
+from .face_verifier import DaughterFaceVerifier, FaceVerifyResult
 from .person_filter import PersonFilter
 
 
@@ -55,6 +56,7 @@ class DaughterDetector:
         self._cv2 = None
         self._np = None
         self._person_filter: PersonFilter | None = None
+        self._face_verifier: DaughterFaceVerifier | None = None
         self._heuristic_frame_index = 0
         self._next_age_check = 0
         self._cached_child_score = 0.0
@@ -89,6 +91,29 @@ class DaughterDetector:
                 adult_threshold=self.settings.person_filter_adult_threshold,
             )
         return self._person_filter
+
+    def get_face_verifier(self) -> DaughterFaceVerifier | None:
+        if not getattr(self.settings, "rv1106_verify_face_recog_enabled", False):
+            return None
+        if self._face_verifier is None:
+            self._face_verifier = DaughterFaceVerifier(
+                model_path=self.settings.rv1106_verify_face_recog_model_path,
+                gallery_path=self.settings.rv1106_verify_face_recog_gallery_path,
+                yunet_path=(
+                    self.settings.person_filter_model_dir
+                    / "face_detection_yunet_2023mar.onnx"
+                ),
+                threshold=self.settings.rv1106_verify_face_recog_threshold,
+            )
+        return self._face_verifier if self._face_verifier.is_ready() else None
+
+    def verify_daughter_face_paths(
+        self, image_paths: list[Path]
+    ) -> FaceVerifyResult | None:
+        verifier = self.get_face_verifier()
+        if verifier is None or not image_paths:
+            return None
+        return verifier.verify_paths(image_paths)
 
     def _init_onnx(self) -> None:
         if self._net is not None:

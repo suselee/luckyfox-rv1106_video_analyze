@@ -254,6 +254,11 @@ class Settings:
     rv1106_verify_child_face_enabled: bool
     rv1106_verify_child_face_frames: int
     rv1106_verify_child_face_max_person_height: float
+    rv1106_verify_face_recog_enabled: bool
+    rv1106_verify_face_recog_model_path: Path
+    rv1106_verify_face_recog_gallery_path: Path
+    rv1106_verify_face_recog_threshold: float
+    rv1106_verify_face_recog_full_width: int
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -275,6 +280,9 @@ class Settings:
 def load_settings(env_file: str | Path = ".env") -> Settings:
     load_env_file(env_file)
     data_dir = _path("DATA_DIR", "./var")
+    person_filter_model_dir = _path(
+        "PERSON_FILTER_MODEL_DIR", str(data_dir / "person_filter_models")
+    )
     rv1106_probable_policy = _rv1106_probable_policy()
 
     return Settings(
@@ -354,9 +362,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         person_filter_enabled=_bool("PERSON_FILTER_ENABLED", False),
         person_filter_backend=os.getenv("PERSON_FILTER_BACKEND", "yolov11n").strip().lower(),
         person_filter_model_url=os.getenv("PERSON_FILTER_MODEL_URL", "").strip(),
-        person_filter_model_dir=_path(
-            "PERSON_FILTER_MODEL_DIR", str(data_dir / "person_filter_models")
-        ),
+        person_filter_model_dir=person_filter_model_dir,
         person_filter_threshold=_float("PERSON_FILTER_THRESHOLD", 0.3),
         person_filter_face_threshold=_float("PERSON_FILTER_FACE_THRESHOLD", 0.7),
         person_filter_adult_threshold=_float("PERSON_FILTER_ADULT_THRESHOLD", 0.9),
@@ -450,6 +456,23 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ),
         rv1106_verify_child_face_max_person_height=_float(
             "RV1106_VERIFY_CHILD_FACE_MAX_PERSON_HEIGHT", 0.40
+        ),
+        rv1106_verify_face_recog_enabled=_bool(
+            "RV1106_VERIFY_FACE_RECOG_ENABLED", False
+        ),
+        rv1106_verify_face_recog_model_path=_path(
+            "RV1106_VERIFY_FACE_RECOG_MODEL_PATH",
+            str(person_filter_model_dir / "w600k_r50.onnx"),
+        ),
+        rv1106_verify_face_recog_gallery_path=_path(
+            "RV1106_VERIFY_FACE_RECOG_GALLERY_PATH",
+            str(person_filter_model_dir / "daughter_r50.npz"),
+        ),
+        rv1106_verify_face_recog_threshold=_float(
+            "RV1106_VERIFY_FACE_RECOG_THRESHOLD", 0.36
+        ),
+        rv1106_verify_face_recog_full_width=_int(
+            "RV1106_VERIFY_FACE_RECOG_FULL_WIDTH", 1920
         ),
     )
 

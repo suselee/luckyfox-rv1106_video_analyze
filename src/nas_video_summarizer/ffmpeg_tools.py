@@ -370,17 +370,19 @@ async def extract_roi_and_full_frame(
     *,
     roi: tuple[float, float, float, float],
     output_width: int,
+    full_output_width: int | None = None,
 ) -> None:
     """Single-seek dual output: extract a 4K-cropped ROI and full frame in one decode."""
     x, y, width, height = roi
     if width <= 0 or height <= 0:
         raise ValueError("ROI width and height must be positive")
     out_w = max(32, output_width)
+    full_w = max(32, full_output_width) if full_output_width is not None else out_w
     filter_complex = (
         f"[0:v]split=2[roi_in][full_in];"
         f"[roi_in]crop=iw*{width:.8f}:ih*{height:.8f}:"
         f"iw*{x:.8f}:ih*{y:.8f},scale={out_w}:-2[roi_out];"
-        f"[full_in]scale={out_w}:-2[full_out]"
+        f"[full_in]scale={full_w}:-2[full_out]"
     )
     command = [
         settings.ffmpeg_bin,
@@ -594,7 +596,7 @@ def _concat_escape(path: Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
-async def remux_elementary_stream(
+def build_remux_elementary_stream_command(
     settings: Settings,
     input_path: Path,
     output_path: Path,
@@ -605,18 +607,8 @@ async def remux_elementary_stream(
     audio_rate: int | None = None,
     audio_channels: int | None = None,
     creation_time: datetime | None = None,
-) -> None:
-    """把裸基本流 (H.264/H.265 Annex-B) 以 -c copy 重封装为 MP4。
-
-    es_format 为 ffmpeg 输入格式名 ("h264"/"hevc"); 为 None 时由 ffmpeg
-    按文件扩展名自行探测。仅用于板端上传的板载环形缓冲片段。
-
-    可选音频: audio_path 为板端上传的音频裸流, audio_format 为 ffmpeg
-    输入 demuxer ("alaw"/"mulaw"/"aac"); G711 需要 audio_rate/
-    audio_channels 显式给出 (默认 8000/1)。音频默认 -c:a copy
-    (CLIP_AUDIO_CODEC=aac 时重编码, 便于浏览器播放)。
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+) -> list[str]:
+    """构造将裸基本流 (或已有 MP4) -c copy 封装为 MP4 的 ffmpeg 命令。"""
     command = [
         settings.ffmpeg_bin,
         "-hide_banner",
@@ -666,6 +658,43 @@ async def remux_elementary_stream(
         "+faststart",
         str(output_path),
     ]
+    return command
+
+
+async def remux_elementary_stream(
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+    *,
+    es_format: str | None = None,
+    audio_path: Path | None = None,
+    audio_format: str | None = None,
+    audio_rate: int | None = None,
+    audio_channels: int | None = None,
+    creation_time: datetime | None = None,
+) -> None:
+    """把裸基本流 (H.264/H.265 Annex-B) 以 -c copy 重封装为 MP4。
+
+    es_format 为 ffmpeg 输入格式名 ("h264"/"hevc"); 为 None 时由 ffmpeg
+    按文件扩展名自行探测。仅用于板端上传的板载环形缓冲片段。
+
+    可选音频: audio_path 为板端上传的音频裸流, audio_format 为 ffmpeg
+    输入 demuxer ("alaw"/"mulaw"/"aac"); G711 需要 audio_rate/
+    audio_channels 显式给出 (默认 8000/1)。音频默认 -c:a copy
+    (CLIP_AUDIO_CODEC=aac 时重编码, 便于浏览器播放)。
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = build_remux_elementary_stream_command(
+        settings,
+        input_path,
+        output_path,
+        es_format=es_format,
+        audio_path=audio_path,
+        audio_format=audio_format,
+        audio_rate=audio_rate,
+        audio_channels=audio_channels,
+        creation_time=creation_time,
+    )
     await _run_command(command, "ffmpeg remux failed")
 
 

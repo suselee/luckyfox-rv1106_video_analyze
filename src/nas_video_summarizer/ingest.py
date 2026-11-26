@@ -30,6 +30,7 @@ from typing import Any
 from .archive import rebuild_day_archive
 from .config import Settings
 from .database import Database
+from .daughter_detector import ProbableVerification
 from .ffmpeg_tools import (
     extract_cropped_frame,
     extract_roi_and_full_frame,
@@ -819,14 +820,21 @@ async def _verify_probable_clip(
             roi_path = Path(temp_dir) / f"clip-roi-{index}.jpg"
             full_path = Path(temp_dir) / f"clip-full-{index}.jpg"
             if use_dual_extract:
+                dual_kwargs: dict[str, Any] = {
+                    "roi": target.roi,
+                    "output_width": settings.rv1106_verify_frame_width,
+                }
+                if getattr(settings, "rv1106_verify_face_recog_enabled", False):
+                    dual_kwargs["full_output_width"] = getattr(
+                        settings, "rv1106_verify_face_recog_full_width", 1920
+                    )
                 await extract_roi_and_full_frame(
                     settings,
                     source_mp4,
                     roi_path,
                     full_path,
                     target.offset_seconds,
-                    roi=target.roi,
-                    output_width=settings.rv1106_verify_frame_width,
+                    **dual_kwargs,
                 )
                 if full_path.exists():
                     full_frames_cached.append(full_path)
@@ -844,6 +852,41 @@ async def _verify_probable_clip(
         if not frames:
             # 切片解不出帧: 无法证伪, 宁多存。
             return True, "no_frames_fallback", None
+        if getattr(settings, "rv1106_verify_face_recog_enabled", False) and hasattr(
+            detector, "verify_daughter_face_paths"
+        ):
+            face_paths = full_frames_cached or frames
+            face_res = detector.verify_daughter_face_paths(face_paths)
+            if face_res is not None:
+                if face_res.matched:
+                    print(
+                        f"[INGEST] {job_key}: 4K daughter_face matched "
+                        f"sim={face_res.best_similarity:.3f} "
+                        f"hits={face_res.hit_frames} "
+                        f"faces={face_res.faces_checked} "
+                        f"px={face_res.best_face_px}",
+                        flush=True,
+                    )
+                    face_verification = ProbableVerification(
+                        accepted=True,
+                        positive_frames=face_res.hit_frames,
+                        required_frames=1,
+                        evidence=("daughter_face",),
+                        reason=(
+                            f"4K ArcFace matched ({face_res.best_similarity:.3f})"
+                        ),
+                        decision="daughter_face",
+                        sampled_frames=len(face_paths),
+                        face_frames=face_res.hit_frames,
+                    )
+                    return True, "daughter_face", face_verification
+                print(
+                    f"[INGEST] {job_key}: 4K daughter_face miss "
+                    f"sim={face_res.best_similarity:.3f} "
+                    f"faces={face_res.faces_checked} "
+                    f"px={face_res.best_face_px}; continuing verify",
+                    flush=True,
+                )
         verification = detector.verify_board_probable_paths(
             frames,
             required_frames=2,
@@ -1054,7 +1097,7 @@ async def save_ingested_clip(
                     else:
                         spool.remove(job_dir)
                     return None
-                if decision in {"child_face", "daughter_onnx"}:
+                if decision in {"child_face", "daughter_onnx", "daughter_face"}:
                     child_evidence = 1.0
                 elif decision == "faceless_person":
                     child_evidence = 0.6
@@ -1140,7 +1183,7 @@ async def _finalize_ingested_clip(
         1.0, score * 0.6 + activity_score * 0.25 + child_evidence * 0.15
     )
     confirmed = identity == "confirmed" or face_score >= 0.5
-    verified_child_face = verify_decision in {"child_face", "daughter_onnx"}
+    verified_child_face = verify_decision in {"child_face", "daughter_onnx", "daughter_face"}
     title = (
         "Daughter confirmed by RV1106"
         if confirmed

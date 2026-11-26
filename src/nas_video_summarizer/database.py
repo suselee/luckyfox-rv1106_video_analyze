@@ -1012,6 +1012,20 @@ class Database:
         moment["favorited"] = bool(moment["favorited"])
         return moment
 
+    def get_moment_ids_by_trigger_keys(
+        self, trigger_keys: list[str]
+    ) -> dict[str, int]:
+        cleaned = [key for key in trigger_keys if key]
+        if not cleaned:
+            return {}
+        placeholders = ",".join("?" for _ in cleaned)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT trigger_key, id FROM moments WHERE trigger_key IN ({placeholders})",
+                tuple(cleaned),
+            ).fetchall()
+        return {str(row["trigger_key"]): int(row["id"]) for row in rows}
+
     def set_favorite(self, moment_id: int, favorited: bool) -> None:
         with self.connect() as conn:
             conn.execute(

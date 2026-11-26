@@ -339,6 +339,13 @@ function renderRejected(items) {
                 data-action="rejected-uncertain"
               >? 不确定</button>
             </div>
+            <div class="actions">
+              <button
+                class="button rescue-btn ${item.rescued ? "active-rescued" : ""}"
+                data-action="rejected-rescue"
+                ${item.rescued ? "disabled" : ""}
+              >${item.rescued ? "✓ 已捞回保存" : "+ 捞回保存"}</button>
+            </div>
           </div>
         </article>
       `;
@@ -438,6 +445,26 @@ momentsContainer.addEventListener("click", async (event) => {
   try {
     if (card.dataset.source === "rejected") {
       const name = card.dataset.name;
+      if (action === "rejected-rescue") {
+        const res = await fetchJson(`/api/rejected/${encodeURIComponent(name)}/rescue`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        const target = uiState.rejected.find((item) => item.name === name);
+        if (target) {
+          target.rescued = true;
+          target.rescued_moment_id = res.moment_id;
+          target.feedback_label = "daughter";
+        }
+        if (uiState.health && res.summary) {
+          uiState.health.feedback = res.summary;
+          renderHealth(uiState.health);
+        }
+        const refreshed = await fetchJson("/api/moments");
+        uiState.moments = refreshed.moments || [];
+        renderActiveTab();
+        return;
+      }
       const labelMap = {
         "rejected-daughter": "daughter",
         "rejected-adult": "adult_only",
